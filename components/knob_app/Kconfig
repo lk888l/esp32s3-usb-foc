@@ -1,0 +1,27 @@
+menu "SmartKnob"
+choice KNOB_TRANSPORT
+    prompt "Tuning transport"
+    default KNOB_CONSOLE_USB
+config KNOB_CONSOLE_UART
+    bool "DevKitC COM port (UART0 GPIO43/44, 115200)"
+config KNOB_CONSOLE_USB
+    bool "Native USB Serial/JTAG (GPIO19/20)"
+    help
+        Connect to the board USB connector, not the COM/UART bridge.
+        USB console logging alone does not receive SmartKnob commands.
+        Keep console logs off the tuning transport to preserve JSON frames.
+endchoice
+config KNOB_ALLOW_WEAK_MAGNET
+    bool "Allow AS5600 ML (weak magnet) while MD is set"
+    default n
+    help
+        User-approved mechanical constraint: report ML as a warning. Missing
+        magnet, strong-field overflow, I2C errors and angle jumps still fault.
+config KNOB_DIAGNOSTICS
+    bool "Enable bounded FreeRTOS motor release tests"
+    default n
+    help
+        Builds an idle test task and explicit diagnose/read commands. Each test
+        uses the normal current regulator, records on-board samples, stops and
+        restores the prior configuration. Never starts a test at boot.
+endmenu

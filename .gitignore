@@ -1,0 +1,44 @@
+# ESP-IDF（保留 sdkconfig.defaults 和 dependencies.lock）
+/build/
+/build-*/
+/managed_components/
+/sdkconfig
+/sdkconfig.old
+
+# CMake / Ninja
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+Testing/
+build.ninja
+rules.ninja
+.ninja_deps
+.ninja_log
+compile_commands.json
+CMakeUserPresets.json
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# 编辑器缓存与本机配置
+/.vscode/settings.json
+/.vscode/c_cpp_properties.json
+.idea/
+/.cache/
+*.swp
+*.swo
+*~
+
+# 系统文件
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
