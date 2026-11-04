@@ -49,7 +49,7 @@ static void boundaries() {
 
 static void slew() {
     for (float dt : {.00025f, .0005f, .001f, .002f})
-        for (float limit : {.02f, .2f, .65f, 1.0f})
+        for (float limit : {.02f, .2f, .65f, 1.0f, max_motor_current})
             for (float sign : {-1.0f, 1.0f}) {
                 HapticSpeedLimiter speed;
                 float previous = limit;
@@ -80,28 +80,29 @@ static void slew() {
 
 static void integrated_motion() {
     // Production ordering: wrapped encoder, detents, clicks, speed envelope,
-    // electrical direction, current target slew. Test fine detents at speed.
+    // electrical direction, measured-current limiting. Test fine detents at speed.
     for (Mode mode : {Mode::free, Mode::detents, Mode::bounded, Mode::spring})
+      for (float limit : {.8f, max_motor_current})
         for (float sign : {-1.0f, 1.0f})
             for (float electrical_sign : {-1.0f, 1.0f})
                 for (float dt : {.0005f, .001f, .002f}) {
                     Config c; c.mode = mode; c.width = pi/180;
                     c.min_position = -12; c.max_position = 12;
-                    c.current_limit = 1; c.strength = 10; c.endstop = 20; c.damping = .5f;
+                    c.current_limit = limit; c.strength = 100; c.endstop = 20; c.damping = .5f;
                     AngleTracker angle; assert(angle.update(0, dt));
                     Haptics h; h.reset(0);
                     HapticSpeedLimiter speed;
-                    CurrentLimiter current; current.reset(1);
+                    CurrentLimiter current; current.reset(limit);
                     float position = 0, previous_target = 0;
                     for (int i = 0; i < static_cast<int>(.3f/dt); ++i) {
                         position += sign*60*dt;
                         assert(angle.update(wrap(position), dt));
                         const float click = i%12 < 6 ? .08f : -.08f;
                         const float request = h.step(c, angle.angle(), angle.haptic_velocity())+click;
-                        const float faded = speed.step(request, angle.velocity(), 1, dt);
-                        const float target = current.step(faded*electrical_sign, {}, 0, 1, dt);
-                        assert(std::abs(target) <= 1+1e-6f);
-                        assert(std::abs(target-previous_target) <= 100*dt+1e-5f);
+                        const float faded = speed.step(request, angle.velocity(), limit, dt);
+                        const float target = current.step(faded*electrical_sign, {}, 0, limit, dt);
+                        assert(std::abs(target) <= limit+1e-6f);
+                        assert(near(target, faded*electrical_sign));
                         previous_target = target;
                         if (i*dt > .05f) {
                             assert(speed.paused() && near(speed.scale(), 0));
@@ -116,22 +117,22 @@ static void integrated_motion() {
                     // Reconfiguration and zeroing must not reset the speed latch.
                     const Config old = c; c.width *= 2;
                     h.reconfigure(old, c, angle.angle());
-                    assert(near(speed.step(.08f, angle.velocity(), 1, dt), 0));
+                    assert(near(speed.step(.08f, angle.velocity(), limit, dt), 0));
                     h.reset(angle.angle());
-                    assert(near(speed.step(.08f, angle.velocity(), 1, dt), 0));
+                    assert(near(speed.step(.08f, angle.velocity(), limit, dt), 0));
                     // Measured speed decays and torque returns without re-enabling.
                     float previous_scale = 0;
                     for (int i = 0; i < static_cast<int>(.7f/dt)+1; ++i) {
                         assert(angle.update(wrap(position), dt));
-                        const float faded = speed.step(.68f, angle.velocity(), 1, dt);
-                        const float target = current.step(faded*electrical_sign, {}, 0, 1, dt);
+                        const float faded = speed.step(limit, angle.velocity(), limit, dt);
+                        const float target = current.step(faded*electrical_sign, {}, 0, limit, dt);
                         assert(speed.scale() >= previous_scale);
                         assert(speed.scale()-previous_scale <= dt/.5f+1e-6f);
-                        assert(std::abs(target-previous_target) <= 100*dt+1e-5f);
+                        assert(near(target, faded*electrical_sign));
                         previous_scale = speed.scale(); previous_target = target;
                     }
                     assert(!speed.paused() && !speed.limited());
-                    assert(near(previous_target, .68f*electrical_sign));
+                    assert(near(previous_target, limit*electrical_sign));
                 }
     for (Mode mode : {Mode::spring, Mode::bounded}) {
         Config c; c.mode = mode;
@@ -183,11 +184,11 @@ static void invalid_inputs() {
     for (float dt : {0.0f, -.001f, .0021f}) {
         HapticSpeedLimiter speed; assert(speed.step(1, 0, 1, dt) == 0);
     }
-    for (float limit : {0.0f, -.1f, 1.01f}) {
+    for (float limit : {0.0f, -.1f, std::nextafter(max_motor_current, std::numeric_limits<float>::infinity())}) {
         HapticSpeedLimiter speed; assert(speed.step(1, 0, limit, .0005f) == 0);
     }
 }
 int main() {
     boundaries(); slew(); integrated_motion(); elastic_return(); invalid_inputs();
-    std::cout << "PASS: speed fade/recovery, hysteresis, all modes, fine detents, clicks, current slew, invalid inputs.\n";
+    std::cout << "PASS: speed fade/recovery, hysteresis, all modes through 4.5 A, fine detents, clicks, direct current targets, invalid inputs.\n";
 }

@@ -29,7 +29,7 @@ def read_replies(device, ids):
                     replies[reply["id"]] = reply
             else:
                 line.append(byte)
-                require(len(line) <= 4096, "Oversize USB reply")
+                require(len(line) <= 8192, "Oversize USB reply")
     require(not pending, f"USB replies missing: {pending}")
     return replies
 
@@ -80,16 +80,26 @@ def main():
         device.request("enable")
         time.sleep(.25)
         require(device.request("status")["state"] == "active", "Enable did not complete")
-        deadline = time.monotonic() + 1.3
+        lease_ms = initial.get("host_lease_ms", 1000)
+        deadline = time.monotonic() + max(1.3, lease_ms / 1000 + .3)
         while time.monotonic() < deadline:
             reply = device.request("enable", allow_error=True)
             require(not reply["ok"] and reply["error"] == "idle_required", "Unexpected repeated enable result")
             time.sleep(.04)
-        require(reply["state"] == "fault" and reply["fault"] == "host_timeout", "Refused commands renewed the lease")
-        require(reply["duty"] == [0, 0, 0] and not reply["current_valid"], "Lease expiry did not stop output")
-        report["refused_commands_expiry"] = reply
-        device.request("clear")
-        passed("well_formed_refused_commands_do_not_renew_lease")
+        if lease_ms:
+            require(reply["state"] == "fault" and reply["fault"] == "host_timeout", "Refused commands renewed the lease")
+            require(reply["duty"] == [0, 0, 0] and not reply["current_valid"], "Lease expiry did not stop output")
+            report["refused_commands_expiry"] = reply
+            device.request("clear")
+            passed("well_formed_refused_commands_do_not_renew_lease")
+        else:
+            time.sleep(2)  # No commands at all: standalone haptics must keep running.
+            reply = device.request("status")
+            require(reply["state"] == "active" and reply["fault"] == "none", "Standalone haptics stopped without a lease")
+            report["standalone_without_polling"] = reply
+            stopped = device.request("disable")
+            require(stopped["state"] == "idle" and stopped["target"] == 0 and stopped["duty"] == [0, 0, 0], "Explicit disable did not stop output")
+            passed("standalone_no_heartbeat_and_explicit_stop")
         report["passed"] = True
     except Exception as error:
         report["error"] = str(error)

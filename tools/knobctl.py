@@ -2,6 +2,7 @@
 """USB commissioning client. Requires pyserial; running commands always stop on exit."""
 import argparse
 import json
+import sys
 import time
 from pathlib import Path
 import serial
@@ -9,7 +10,17 @@ import serial
 
 class Knob:
     def __init__(self, port):
-        self.serial = serial.Serial(port, 115200, timeout=0.05, write_timeout=0.3)
+        # Set control lines before opening: Windows native USB can otherwise
+        # reset the S3 and silently replace unsaved tuning with NVS defaults.
+        self.serial = serial.Serial(None, 115200, timeout=0.05, write_timeout=0.3)
+        self.serial.dtr = False
+        self.serial.rts = False
+        self.serial.port = port
+        self.serial.open()
+        # Extended sampling diagnostics can exceed Windows' default 4 KiB
+        # receive queue in a single USB transfer while the host is compiling.
+        if sys.platform == "win32":
+            self.serial.set_buffer_size(rx_size=65536, tx_size=8192)
         self.sequence = 0
         self.identified = False
 
@@ -46,7 +57,7 @@ class Knob:
                     if not reply.get("ok") and not allow_error:
                         raise RuntimeError(reply.get("error", "Command rejected"))
                     return reply
-                elif len(line) >= 4096:
+                elif len(line) >= 8192:
                     overflow = True
                 elif not overflow:
                     line.append(byte)

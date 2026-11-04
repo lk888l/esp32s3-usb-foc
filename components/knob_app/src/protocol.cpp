@@ -1,9 +1,16 @@
 #include "protocol.hpp"
+#include "board.hpp"
+#include "encoder_config.hpp"
+#include "settings_identity.hpp"
 #include "nvs.h"
 #include "esp_crc.h"
+#include "esp_system.h"
+#include "esp_app_desc.h"
+#include "esp_timer.h"
 #include <cmath>
 #include <cstring>
 #include <cstddef>
+#include <algorithm>
 namespace knob {
 const char* state_name(State s) {
     constexpr const char* names[] = {"idle", "offsets", "align", "sweep", "settle", "active", "fault"};
@@ -17,6 +24,12 @@ constexpr Field fields[] = {{"bus_voltage", &Config::bus_voltage}, {"sense_gain"
     {"strength", &Config::strength}, {"endstop", &Config::endstop}, {"damping", &Config::damping}, {"snap", &Config::snap}};
 void array(cJSON* obj, const char* name, const std::array<float, 3>& values) {
     cJSON_AddItemToObject(obj, name, cJSON_CreateFloatArray(values.data(), values.size()));
+}
+template <typename T, size_t N>
+void numeric_array(cJSON* obj, const char* name, const std::array<T, N>& values) {
+    std::array<double, N> numbers{};
+    for (size_t i = 0; i < N; ++i) numbers[i] = values[i];
+    cJSON_AddItemToObject(obj, name, cJSON_CreateDoubleArray(numbers.data(), N));
 }
 struct Stored { uint32_t version; Config config; Calibration calibration; uint32_t crc; };
 }
@@ -35,13 +48,20 @@ const char* decode_request(const char* line, Request& r) {
     constexpr NamedOp names[] = {{"status", Op::status}, {"configure", Op::configure}, {"calibrate", Op::calibrate},
         {"enable", Op::enable}, {"disable", Op::disable}, {"clear", Op::clear}, {"zero", Op::zero}, {"pulse", Op::pulse}, {"save", Op::save}
 #if CONFIG_KNOB_DIAGNOSTICS
-        , {"diagnose", Op::diagnose}, {"diagnostic_read", Op::diagnostic_read}
+        , {"diagnose", Op::diagnose}, {"diagnostic_read", Op::diagnostic_read}, {"diagnostic_hold", Op::diagnostic_hold}
 #endif
     };
     bool found = false;
     for (auto n : names) if (!std::strcmp(op->valuestring, n.name)) { r.op = n.op; found = true; }
     if (!found) return fail("unknown_op");
 #if CONFIG_KNOB_DIAGNOSTICS
+    if (r.op == Op::diagnostic_hold) {
+        const auto* current = cJSON_GetObjectItemCaseSensitive(root, "current");
+        if (!cJSON_IsNumber(current) || !std::isfinite(current->valuedouble) ||
+            std::abs(current->valuedouble) < .04 || std::abs(current->valuedouble) > .25)
+            return fail("diagnostic_hold_current_range");
+        r.diagnostic.current = static_cast<float>(current->valuedouble);
+    }
     if (r.op == Op::diagnose) {
         const char* keys[] = {"mode", "velocity", "current", "drive_ms", "observe_ms"};
         double values[5]{};
@@ -92,11 +112,77 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "id", id);
     cJSON_AddStringToObject(root, "device", "smartknob-s3");
     cJSON_AddNumberToObject(root, "protocol", 1);
+    cJSON_AddStringToObject(root, "firmware", "dma-v5-bus-sense");
+    cJSON_AddStringToObject(root, "pwm_profile", pwm_profile_name);
+    const auto* app = esp_app_get_description();
+    char app_sha256[65]{};
+    constexpr char hex[] = "0123456789abcdef";
+    for (size_t i = 0; i < sizeof(app->app_elf_sha256); ++i) {
+        app_sha256[2 * i] = hex[app->app_elf_sha256[i] >> 4];
+        app_sha256[2 * i + 1] = hex[app->app_elf_sha256[i] & 15];
+    }
+    cJSON_AddStringToObject(root, "app_elf_sha256", app_sha256);
+    cJSON_AddStringToObject(root, "current_sampling", Board::staggered_sampling ?
+        "pwm_staggered_adc_gdma_experimental" : "pwm_triggered_adc_gdma");
+    cJSON_AddNumberToObject(root, "current_phase_skew_us", s.phase_skew_us);
+    cJSON_AddBoolToObject(root, "adc_sample_valid", s.adc_sample_valid);
+    cJSON_AddBoolToObject(root, "sampling_restart_required", s.sampling_restart_required);
+    cJSON_AddNumberToObject(root, "adc_completed_mask", s.adc_completed_mask);
+    cJSON_AddNumberToObject(root, "adc_window_after_mask", s.adc_window_after_mask);
+    numeric_array(root, "adc_trigger_elapsed_us", s.adc_trigger_elapsed_us);
+    auto* before = cJSON_AddArrayToObject(root, "adc_pwm_compare_before");
+    auto* after = cJSON_AddArrayToObject(root, "adc_pwm_compare_after");
+    for (int slot = 0; slot < 3; ++slot) {
+        auto* before_row = cJSON_CreateArray(); auto* after_row = cJSON_CreateArray();
+        for (int p = 0; p < 3; ++p) {
+            cJSON_AddItemToArray(before_row, cJSON_CreateNumber(s.adc_pwm_compare_before[slot][p]));
+            cJSON_AddItemToArray(after_row, cJSON_CreateNumber(s.adc_pwm_compare_after[slot][p]));
+        }
+        cJSON_AddItemToArray(before, before_row); cJSON_AddItemToArray(after, after_row);
+    }
+    cJSON_AddNumberToObject(root, "control_nominal_hz", Board::control_hz);
+    cJSON_AddNumberToObject(root, "encoder_nominal_hz", Board::encoder_hz);
+    cJSON_AddNumberToObject(root, "pwm_hz", Board::pwm_hz);
+    cJSON_AddNumberToObject(root, "pwm_half_period_ticks", Board::half_period);
+    cJSON_AddNumberToObject(root, "pwm_resolution_hz", Board::resolution);
+    cJSON_AddNumberToObject(root, "pwm_duty_floor", pwm_zero_clamp ? 0 : duty_floor);
+    cJSON_AddNumberToObject(root, "pwm_min_active_duty", duty_floor);
+    cJSON_AddBoolToObject(root, "pwm_zero_clamp", pwm_zero_clamp);
+    cJSON_AddNumberToObject(root, "pwm_duty_ceiling", duty_ceiling);
+    cJSON_AddNumberToObject(root, "max_voltage_limit", max_output_voltage(s.config.bus_voltage));
+    cJSON_AddNumberToObject(root, "available_voltage_limit", max_output_voltage(s.bus_voltage_used));
+    cJSON_AddNumberToObject(root, "configured_max_voltage_limit", max_output_voltage(s.config.bus_voltage));
+    cJSON_AddNumberToObject(root, "effective_voltage_limit", s.effective_voltage_limit);
+    cJSON_AddBoolToObject(root, "bus_voltage_sensing", BusVoltageMonitor::enabled);
+    cJSON_AddStringToObject(root, "bus_voltage_source", BusVoltageMonitor::enabled ? "adc2_gpio11" : "configured");
+    cJSON_AddNumberToObject(root, "bus_voltage", s.bus_voltage_used);
+    cJSON_AddBoolToObject(root, "bus_voltage_valid", s.bus_voltage_valid);
+    cJSON_AddNumberToObject(root, "bus_voltage_age_us", s.bus_voltage_age_us);
+    cJSON_AddNumberToObject(root, "bus_voltage_raw", s.bus_sample.raw);
+    cJSON_AddNumberToObject(root, "bus_voltage_adc_mv", s.bus_sample.millivolts);
+    cJSON_AddNumberToObject(root, "bus_voltage_measured", s.bus_sample.volts);
+    cJSON_AddNumberToObject(root, "bus_voltage_error", s.bus_sample.error);
+    cJSON_AddNumberToObject(root, "bus_voltage_divider", BusVoltageMonitor::divider_ratio);
+    cJSON_AddStringToObject(root, "detent_profile", "localized_barrier");
+    cJSON_AddBoolToObject(root, "detent_quiet_velocity", false);
+    cJSON_AddBoolToObject(root, "haptic_position_filter", false);
+    cJSON_AddBoolToObject(root, "current_target_slew", false);
+    cJSON_AddNumberToObject(root, "host_lease_ms", CONFIG_KNOB_HOST_LEASE_MS);
+    cJSON_AddNumberToObject(root, "current_feedforward_ohms", CONFIG_KNOB_PHASE_RESISTANCE_MILLIOHM * .001);
+    cJSON_AddNumberToObject(root, "reset_reason", esp_reset_reason());
+    cJSON_AddNumberToObject(root, "uptime_ms", esp_timer_get_time() / 1000);
+    cJSON_AddNumberToObject(root, "minimum_free_heap", esp_get_minimum_free_heap_size());
     cJSON_AddNumberToObject(root, "current_limit_max", max_motor_current);
+    cJSON_AddNumberToObject(root, "strength_max", max_haptic_strength);
     cJSON_AddNumberToObject(root, "current_absolute_trip", absolute_current_trip);
+    cJSON_AddNumberToObject(root, "current_peak_trip", peak_current_trip);
+    cJSON_AddNumberToObject(root, "current_peak_trip_ms", current_peak_trip_us / 1000.0);
+    cJSON_AddNumberToObject(root, "current_overload_trip_ms", current_overload_trip_us / 1000.0);
+    cJSON_AddNumberToObject(root, "current_trip_recovery_ratio", current_trip_recovery_ratio);
     cJSON_AddNumberToObject(root, "current_trip_limit", s.current_trip_limit);
     cJSON_AddNumberToObject(root, "current_target_limit", s.current_target_limit);
     cJSON_AddBoolToObject(root, "current_limited", s.current_limited);
+    cJSON_AddBoolToObject(root, "quiet_output", s.quiet_output);
     cJSON_AddNumberToObject(root, "haptic_scale", s.haptic_scale);
     cJSON_AddBoolToObject(root, "speed_limited", s.speed_limited);
     cJSON_AddBoolToObject(root, "haptic_paused", s.haptic_paused);
@@ -105,16 +191,29 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "haptic_resume_speed", haptic_resume_speed);
     cJSON_AddNumberToObject(root, "haptic_resume_hold_ms", haptic_resume_hold_s * 1000);
     cJSON_AddNumberToObject(root, "haptic_fade_in_ms", haptic_fade_in_s * 1000);
+    cJSON_AddNumberToObject(root, "detent_assist_fade_start", detent_assist_fade_start);
+    cJSON_AddNumberToObject(root, "detent_assist_cutoff", detent_assist_cutoff);
+    cJSON_AddNumberToObject(root, "elastic_min_damping", elastic_min_damping);
     cJSON_AddBoolToObject(root, "fault_current_valid", s.fault_current_valid);
     cJSON_AddNumberToObject(root, "fault_current_trip_limit", s.fault_current_trip_limit);
     array(root, "fault_currents", s.fault_currents);
+    if (s.fault_current_valid) {
+        cJSON* motion = cJSON_AddObjectToObject(root, "fault_motion");
+        cJSON_AddNumberToObject(motion, "angle", s.fault_angle);
+        cJSON_AddNumberToObject(motion, "velocity", s.fault_velocity);
+        cJSON_AddNumberToObject(motion, "velocity_fast", s.fault_velocity_fast);
+    }
 #if CONFIG_KNOB_CONSOLE_UART
     cJSON_AddStringToObject(root, "transport", "uart0");
 #else
     cJSON_AddStringToObject(root, "transport", "usb_serial_jtag");
 #endif
+    cJSON_AddStringToObject(root, "encoder", encoder_config::name);
+    cJSON_AddStringToObject(root, "encoder_interface", encoder_config::transport);
+    cJSON_AddNumberToObject(root, "encoder_resolution_bits", encoder_config::resolution_bits);
+    cJSON_AddBoolToObject(root, "encoder_dma", encoder_config::uses_dma);
 #if CONFIG_KNOB_ALLOW_WEAK_MAGNET
-    cJSON_AddBoolToObject(root, "weak_magnet_allowed", true);
+    cJSON_AddBoolToObject(root, "weak_magnet_allowed", encoder_config::kind == EncoderKind::as5600);
 #else
     cJSON_AddBoolToObject(root, "weak_magnet_allowed", false);
 #endif
@@ -138,8 +237,10 @@ cJSON* encode_reply(int id, const Reply& r) {
         for (int i = 0; i < r.diagnostic_count; ++i) {
             const auto& v = r.diagnostic_samples[i];
             const double row[] = {double(v.elapsed_us), v.angle, v.velocity, v.target, v.iq, v.id,
-                                  v.scale, v.voltage_q, v.phase_peak, double(v.flags), v.velocity_fast};
-            cJSON_AddItemToArray(samples, cJSON_CreateDoubleArray(row, 11));
+                                  v.scale, v.voltage_q, v.phase_peak, double(v.flags), v.velocity_fast, v.voltage_d,
+                                  double(v.adc_raw_a), double(v.adc_raw_b),
+                                  double(v.sample_start_tick), double(v.sample_end_tick)};
+            cJSON_AddItemToArray(samples, cJSON_CreateDoubleArray(row, 16));
         }
     }
 #endif
@@ -159,6 +260,29 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddBoolToObject(root, "current_valid", s.current_valid);
     cJSON_AddNumberToObject(root, "rejected_samples", s.rejected);
     cJSON_AddNumberToObject(root, "reused_samples", s.reused_samples);
+    cJSON_AddNumberToObject(root, "missed_samples", s.missed_samples);
+    cJSON_AddNumberToObject(root, "control_cycles", s.control_cycles);
+    cJSON_AddNumberToObject(root, "control_hz", s.control_hz);
+    cJSON_AddNumberToObject(root, "control_interval_us", s.control_interval_us);
+    cJSON_AddNumberToObject(root, "control_max_us", s.control_max_us);
+    cJSON_AddNumberToObject(root, "encoder_age_us", s.encoder_age_us);
+    cJSON_AddNumberToObject(root, "encoder_age_max_us", s.encoder_age_max_us);
+    const double dma_words[] = {double(s.adc_dma_words[0]), double(s.adc_dma_words[1])};
+    cJSON_AddItemToObject(root, "adc_dma_words", cJSON_CreateDoubleArray(dma_words, 2));
+    numeric_array(root, "adc_slot_words", s.adc_slot_words);
+    numeric_array(root, "adc_trigger_ticks", s.adc_trigger_ticks);
+    numeric_array(root, "adc_callback_ticks", s.adc_callback_ticks);
+    numeric_array(root, "adc_trigger_sar", s.adc_trigger_sar);
+    numeric_array(root, "adc_callback_sar", s.adc_callback_sar);
+    numeric_array(root, "adc_callback_elapsed_us", s.adc_callback_elapsed_us);
+    cJSON_AddNumberToObject(root, "adc_slot_mask", s.adc_slot_mask);
+    cJSON_AddNumberToObject(root, "adc_trigger_down_mask", s.adc_trigger_down_mask);
+    cJSON_AddNumberToObject(root, "adc_callback_down_mask", s.adc_callback_down_mask);
+    numeric_array(root, "pwm_compare_before", s.pwm_compare_before);
+    numeric_array(root, "pwm_compare_after", s.pwm_compare_after);
+    cJSON_AddNumberToObject(root, "pwm_latch_sequence", s.pwm_latch_sequence);
+    cJSON_AddBoolToObject(root, "pwm_compare_valid", s.pwm_compare_valid);
+    cJSON_AddNumberToObject(root, "pwm_apply_delay_us", s.pwm_apply_delay_us);
     cJSON_AddNumberToObject(root, "sample_us", s.sample_us); cJSON_AddNumberToObject(root, "loop_us", s.loop_us);
     cJSON_AddNumberToObject(root, "encoder_us", s.encoder_us);
     cJSON_AddNumberToObject(root, "control_us", s.control_us);
@@ -170,6 +294,12 @@ cJSON* encode_reply(int id, const Reply& r) {
         cJSON_AddNumberToObject(sample, "end_tick", s.fault_sample_end_tick);
         cJSON_AddNumberToObject(sample, "duration_us", s.fault_sample_us);
         cJSON_AddBoolToObject(sample, "valid", s.fault_sample_valid);
+        if (s.fault_adc_captured) {
+            const double fault_words[] = {double(s.fault_adc_dma_words[0]), double(s.fault_adc_dma_words[1])};
+            cJSON_AddItemToObject(sample, "adc_dma_words", cJSON_CreateDoubleArray(fault_words, 2));
+            cJSON_AddItemToObject(sample, "adc_raw", cJSON_CreateIntArray(s.fault_adc_raw.data(), 2));
+            cJSON_AddItemToObject(sample, "adc_phase", cJSON_CreateIntArray(s.fault_adc_phase.data(), 2));
+        }
     }
     cJSON_AddNumberToObject(root, "sample_start_tick", s.sample_start_tick); cJSON_AddNumberToObject(root, "sample_end_tick", s.sample_end_tick);
     array(root, "currents", s.currents); array(root, "sense_volts", s.volts); array(root, "offsets", s.offsets); array(root, "duty", s.duty);
@@ -187,16 +317,17 @@ bool load_settings(Config& c, Calibration& cal) {
     if (nvs_open("smartknob", NVS_READONLY, &handle) != ESP_OK) return false;
     Stored data{}; size_t length = sizeof(data);
     const auto err = nvs_get_blob(handle, "settings_v1", &data, &length); nvs_close(handle);
-    if (err != ESP_OK || length != sizeof(data) || data.version != 1 ||
-        data.crc != esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&data), offsetof(Stored, crc)) ||
-        validate(data.config) || (data.calibration.valid && !valid_calibration(data.calibration))) return false;
-    c = data.config; cal = data.calibration; return true;
+    if (err != ESP_OK || length != sizeof(data) ||
+        data.crc != esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&data), offsetof(Stored, crc))) return false;
+    return restore_encoder_settings(data.version, data.config, data.calibration,
+                                    encoder_config::calibration_id, c, cal);
 }
 bool save_settings(const Config& c, const Calibration& cal) {
     if (validate(c) || (cal.valid && !valid_calibration(cal))) return false;
     nvs_handle_t handle;
     if (nvs_open("smartknob", NVS_READWRITE, &handle) != ESP_OK) return false;
-    Stored data{}; data.version = 1; data.config = c; data.calibration = cal;
+    Stored data{}; data.version = encoder_settings_version(encoder_config::calibration_id);
+    data.config = c; data.calibration = cal;
     data.crc = esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&data), offsetof(Stored, crc));
     const bool ok = nvs_set_blob(handle, "settings_v1", &data, sizeof(data)) == ESP_OK && nvs_commit(handle) == ESP_OK;
     nvs_close(handle); return ok;
