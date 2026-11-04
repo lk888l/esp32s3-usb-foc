@@ -6,29 +6,208 @@
 #include <algorithm>
 using namespace knob;
 static bool near(float a, float b, float tolerance = 1e-4f) { return std::abs(a - b) < tolerance; }
+static bool valid_duty(float value) {
+    return (pwm_zero_clamp && value == 0) || (value >= duty_floor && value <= duty_ceiling);
+}
+static void test_voltage_capacity() {
+    Config config;
+    // Retain old low-voltage configurations and accept the full physically
+    // available circle, including voltages beyond the former arbitrary 5 V cap.
+    config.bus_voltage = 11.62f;
+    config.voltage_limit = 2.35f;
+    assert(validate(config) == nullptr);
+    config.bus_voltage = 19.4f;
+    config.voltage_limit = 5.1f;
+    assert(validate(config) == nullptr);
+    for (float bus : {4.5f, 5.0f, 11.62f, 19.4f, 24.0f, 30.0f}) {
+        config.bus_voltage = bus;
+        config.voltage_limit = max_output_voltage(bus);
+        assert(validate(config) == nullptr);
+        const float radius = config.voltage_limit;
+        config.voltage_limit = std::nextafter(radius, std::numeric_limits<float>::infinity());
+        assert(validate(config));
+        // Verify line-to-line voltage at the accepted circle boundary through
+        // all sectors, rather than testing only that duty has been clipped.
+        for (int k = 0; k <= 360; ++k) for (float sign : {-1.0f, 1.0f}) {
+            const float angle = k * tau / 360;
+            const Dq voltage{radius * .6f, sign * radius * .8f};
+            const auto pwm = svpwm(voltage, angle, bus);
+            for (float value : pwm) assert(valid_duty(value));
+            const float alpha = voltage.d * std::cos(angle) - voltage.q * std::sin(angle);
+            const float beta = voltage.d * std::sin(angle) + voltage.q * std::cos(angle);
+            assert(near((pwm[0] - pwm[1]) * bus, 1.5f * alpha - .8660254f * beta, 2e-4f));
+            assert(near((pwm[1] - pwm[2]) * bus, 1.7320508f * beta, 2e-4f));
+        }
+    }
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float infinity = std::numeric_limits<float>::infinity();
+    for (float bus : {-1.0f, 0.0f, 4.49f, 30.01f, nan, infinity, -infinity}) {
+        assert(max_output_voltage(bus) == 0);
+        assert(effective_voltage_limit(7.0f, bus) == 0);
+        config.bus_voltage = bus;
+        config.voltage_limit = 0.1f;
+        assert(validate(config));
+    }
+    for (float requested : {-1.0f, 0.0f, nan, infinity, -infinity})
+        assert(effective_voltage_limit(requested, 19.4f) == 0);
+    assert(effective_voltage_limit(2.35f, 19.4f) == 2.35f);
+    assert(effective_voltage_limit(100.0f, 19.4f) == max_output_voltage(19.4f));
+
+    // Simulate bus sag/recovery while both PI axes are demanding saturation.
+    // The PI must observe the same reduced voltage circle as the modulator,
+    // and reconstructing line voltages must not expose extra PWM clipping.
+    CurrentLoop loop;
+    const float requested = max_output_voltage(19.4f);
+    for (float bus : {19.4f, 11.62f, 4.5f, 24.0f, 19.4f}) {
+        const float limit = effective_voltage_limit(requested, bus);
+        for (int n = 0; n < 100; ++n) {
+            const Dq output = loop.step({1.0f, 2.0f}, .0002f, .4f, 200.0f, limit);
+            assert(output.d * output.d + output.q * output.q <= limit * limit + 1e-5f);
+            const float angle = n * .17f;
+            const auto pwm = svpwm(output, angle, bus);
+            const float alpha = output.d * std::cos(angle) - output.q * std::sin(angle);
+            const float beta = output.d * std::sin(angle) + output.q * std::cos(angle);
+            assert(near((pwm[0] - pwm[1]) * bus, 1.5f * alpha - .8660254f * beta, 2e-4f));
+            assert(near((pwm[1] - pwm[2]) * bus, 1.7320508f * beta, 2e-4f));
+        }
+    }
+    const auto stopped = loop.step({1.0f, 2.0f}, .0002f, .4f, 200.0f,
+                                   effective_voltage_limit(requested, nan));
+    assert(stopped.d == 0 && stopped.q == 0);
+}
+static void test_zero_clamp_modulation() {
+    if constexpr (!pwm_zero_clamp) return;
+    constexpr float bus = 19.15f;
+    const float radius = max_output_voltage(bus);
+    assert(near(radius, bus * duty_ceiling / std::sqrt(3.0f)));
+    bool saw_clamped = false, saw_offset = false;
+    std::array<float, 3> previous{};
+    for (float fraction : {0.0f, .001f, .01f, .1f, .5f, .9f, 1.0f, 1.001f, 2.0f, 100.0f}) {
+        for (int n = 0; n <= 7200; ++n) {
+            const float angle = n * tau / 7200;
+            const Dq requested{radius * fraction, 0};
+            const auto pwm = svpwm(requested, angle, bus);
+            for (float pulse : pwm) assert(valid_duty(pulse));
+            const float smallest = *std::min_element(pwm.begin(), pwm.end());
+            if (fraction == 1) {
+                saw_clamped |= smallest == 0;
+                saw_offset |= smallest == duty_floor;
+            }
+            const float alpha = requested.d * std::cos(angle);
+            const float beta = requested.d * std::sin(angle);
+            const float expected_ab = 1.5f * alpha - .8660254f * beta;
+            const float expected_bc = 1.7320508f * beta;
+            const float actual_ab = (pwm[0] - pwm[1]) * bus;
+            const float actual_bc = (pwm[1] - pwm[2]) * bus;
+            if (fraction <= 1) {
+                assert(near(actual_ab, expected_ab, 2e-4f));
+                assert(near(actual_bc, expected_bc, 2e-4f));
+                if (n && fraction == 1) {
+                    // Common-mode switching can jump at the clamp threshold,
+                    // but the line voltages must remain smooth across it and
+                    // across all six electrical sector boundaries.
+                    assert(std::abs(actual_ab - (previous[0] - previous[1]) * bus) < .02f);
+                    assert(std::abs(actual_bc - (previous[1] - previous[2]) * bus) < .02f);
+                }
+            } else {
+                // Over-range requests may shrink uniformly, never rotate the
+                // requested vector or create a pulse below the minimum.
+                const float denominator = expected_ab * expected_ab + expected_bc * expected_bc;
+                const float scale = (actual_ab * expected_ab + actual_bc * expected_bc) / denominator;
+                assert(scale > 0 && scale <= 1.00001f);
+                assert(near(actual_ab, scale * expected_ab, 2e-4f));
+                assert(near(actual_bc, scale * expected_bc, 2e-4f));
+            }
+            previous = pwm;
+        }
+    }
+    assert(saw_clamped && saw_offset);
+    // At the largest line span, clamping the minimum phase gains the full 4%
+    // window without shortening either nonzero phase's 2 us minimum pulse.
+    const auto pwm = svpwm({7.2f, 0}, pi / 6, bus);
+    assert(*std::min_element(pwm.begin(), pwm.end()) == 0);
+    assert(near(*std::max_element(pwm.begin(), pwm.end()), std::sqrt(3.0f) * 7.2f / bus));
+}
+static void test_direct_angle_prediction() {
+    // Every encoder position is available to haptics on its first update.
+    // Exercise both supported resolutions and reset across the wrap boundary.
+    for (unsigned counts : {4096U, 16384U}) {
+        const float code = tau / counts;
+        AngleTracker tracker;
+        for (int run = 0; run < 2; ++run) {
+            assert(tracker.update(tau - code, .0004f));
+            assert(near(tracker.haptic_angle(), tau - code, 1e-6f));
+            assert(tracker.update(0, .0004f));
+            assert(near(tracker.angle(), tau, 1e-6f));
+            assert(tracker.update(code, .0004f));
+            assert(near(tracker.haptic_angle(), tau + code, 1e-6f));
+            assert(tracker.haptic_velocity() > 0);
+            assert(tracker.update(tau - code, .0004f));
+            assert(near(tracker.haptic_angle(), tau - code, 1e-6f));
+            // Invalid samples leave the last trustworthy position intact.
+            const float saved = tracker.haptic_angle();
+            assert(!tracker.update(1, .0004f));
+            assert(!tracker.update(0, 0));
+            assert(!tracker.update(std::numeric_limits<float>::quiet_NaN(), .0004f));
+            assert(tracker.haptic_angle() == saved);
+            tracker.reset();
+            assert(tracker.angle() == 0 && tracker.wrapped_angle() == 0);
+            assert(tracker.velocity() == 0 && tracker.haptic_velocity() == 0);
+        }
+    }
+    // Timestamp compensation follows constant motion, including multi-turn
+    // travel, unequal encoder periods, and reversals through zero.
+    for (float speed : {-20.0f, -2.0f, 2.0f, 20.0f}) {
+        AngleTracker tracker;
+        float position = speed < 0 ? .01f : tau - .01f;
+        assert(tracker.update(position, .0004f));
+        for (int n = 0; n < 1000; ++n) {
+            const float dt = n % 2 ? .0003f : .0005f;
+            position += speed * dt;
+            assert(tracker.update(wrap(position), dt));
+            assert(near(tracker.haptic_angle(), position, 3e-6f));
+        }
+        assert(near(tracker.haptic_velocity(), speed, .01f));
+        for (float horizon : {0.0f, .000005f, .0004f, .002f})
+            assert(near(tracker.haptic_angle(horizon), position + speed * horizon, 2e-5f));
+        assert(tracker.haptic_angle(-1) == tracker.angle());
+        assert(tracker.haptic_angle(1) == tracker.haptic_angle(.002f));
+        for (int n = 0; n < 2; ++n) {
+            position -= speed * .0004f;
+            assert(tracker.update(wrap(position), .0004f));
+            assert(near(tracker.haptic_angle(), position, 3e-6f));
+        }
+        assert(tracker.haptic_velocity() * speed < 0); // Reversal within 0.8 ms.
+        assert((tracker.haptic_angle(.0004f) - tracker.angle()) * speed < 0);
+    }
+}
 int main() {
     assert(near(phase_current(1.80f, 1.65f, .15f), 1.0f));
     assert(near(phase_current(1.50f, 1.65f, .15f), -1.0f));
     assert(near(phase_current(1.65f, 1.65f, .3f), 0.0f));
     Config c;
     assert(validate(c) == nullptr);
-    c.current_limit = 1; assert(validate(c) == nullptr);
-    c.current_limit = 1.01f; assert(validate(c));
+    c.current_limit = max_motor_current; assert(validate(c) == nullptr);
+    c.current_limit = max_motor_current + .01f; assert(validate(c));
+    c = {}; c.strength = max_haptic_strength; assert(validate(c) == nullptr);
+    c.strength = max_haptic_strength + .01f; assert(validate(c));
     c = {}; c.sense_gain = .2f; assert(validate(c));
     c = {}; c.width = 0; assert(validate(c));
     c = {}; c.snap = .49f; assert(validate(c));
     c = {}; c.mode = static_cast<Mode>(5); assert(validate(c));
     c = {}; c.current_kp = std::numeric_limits<float>::quiet_NaN(); assert(validate(c));
-    c = {}; c.bus_voltage = 4.5; c.voltage_limit = 1.5; assert(validate(c));
+    c = {}; c.bus_voltage = 4.5; c.voltage_limit = max_output_voltage(c.bus_voltage) + .01f; assert(validate(c));
     c = {}; c.min_position = 12; c.max_position = 11; assert(validate(c));
+    test_voltage_capacity();
+    test_zero_clamp_modulation();
     Calibration cal{true, -1, 7, 1}; assert(valid_calibration(cal));
     cal.pole_pairs = 12; assert(!valid_calibration(cal));
     // Line voltage must match the inverse Park/Clarke result across every sector,
     // including at sector boundaries and negative torque.
-    for (int k = 0; k < 721; ++k) for (float q : {-1.0f, 0.0f, 1.0f}) {
+    for (int k = 0; k < 721; ++k) for (float q : {-3.0f, -1.0f, 0.0f, 1.0f, 3.0f}) {
         const float a = k * tau / 360;
         const Dq v{0.25f, q}; const auto pwm = svpwm(v, a, 11.62f);
-        for (float duty : pwm) assert(duty >= duty_floor && duty <= duty_ceiling);
+        for (float duty : pwm) assert(valid_duty(duty));
         const float alpha = v.d * std::cos(a) - v.q * std::sin(a);
         const float beta = v.d * std::sin(a) + v.q * std::cos(a);
         assert(near((pwm[0] - pwm[1]) * 11.62f, 1.5f * alpha - .8660254f * beta));
@@ -36,7 +215,7 @@ int main() {
         const auto dq = park(currents, a); assert(near(dq.d, v.d) && near(dq.q, v.q));
     }
     for (float v : {10.0f, 100.0f, -100.0f}) for (int k = 0; k < 100; ++k) {
-        for (float duty : svpwm({v,v}, k*.07f, 5)) assert(duty >= duty_floor && duty <= duty_ceiling);
+        for (float duty : svpwm({v,v}, k*.07f, 5)) assert(valid_duty(duty));
     }
     for (float duty : svpwm({1,1}, 0, 0)) assert(duty == duty_floor);
     Pi controller;
@@ -66,15 +245,17 @@ int main() {
     assert(!angle.update(2, .0005)); assert(!angle.update(0, 0));
     // Fast damping feedback changes sign during a reversal while the quieter
     // speed-envelope estimate is still decaying from the previous direction.
+    // Damping must reverse within 1 ms; the old 2 ms filter failed this bound.
     AngleTracker reversal; float position = 0;
     assert(reversal.update(0, .0005f));
     for (int i = 0; i < 200; ++i) {
         position += .01f; assert(reversal.update(wrap(position), .0005f));
     }
-    for (int i = 0; i < 6; ++i) {
+    for (int i = 0; i < 2; ++i) {
         position -= .01f; assert(reversal.update(wrap(position), .0005f));
     }
     assert(reversal.haptic_velocity() < 0 && reversal.velocity() > 0);
+    test_direct_angle_prediction();
     SettlingMonitor settling;
     for (int n = 0; n < 150; ++n) settling.update(.003f*std::sin(n), .001f);
     assert(!settling.still()); // A single short quiet interval is insufficient.
@@ -83,7 +264,7 @@ int main() {
     for (int n = 0; n < 100; ++n) settling.update(n*.001f, .001f);
     assert(!settling.still()); // Sustained rotation invalidates the alignment.
     settling.reset(); assert(!settling.still());
-    Haptics h; c = {}; c.width = .1f; c.strength = 1; c.damping = 0;
+    Haptics h; c = {}; c.width = .1f; c.strength = 1; c.damping = 0; c.snap = .6f;
     h.reset(0); assert(h.step(c, .04f, 0) < 0); assert(h.position() == 0);
     h.step(c, .061f, 0); assert(h.position() == 1);
     h.step(c, .059f, 0); assert(h.position() == 1); // hysteresis prevents chatter
@@ -107,7 +288,7 @@ int main() {
     Config next = c; next.strength = .7f; next.current_limit = .3f;
     h.reconfigure(c, next, .42f);
     assert(h.position() == 4); assert(near(h.sub_position(next, .42f), sub));
-    assert(h.step(next, .42f, 0) < 0);
+    assert(near(h.step(next, .42f, 0), 0)); // Quiet interval preserves geometry.
     // Mode and spacing changes establish a center at the current angle.
     c = next; next.mode = Mode::bounded; next.min_position = 3; next.max_position = 5;
     h.reconfigure(c, next, 1.2f);
@@ -119,5 +300,5 @@ int main() {
     c = next; next.mode = Mode::spring; h.reconfigure(c, next, 2);
     c = next; next.strength = .5f; h.reconfigure(c, next, 2.1f);
     assert(h.step(next, 2.1f, 0) < 0);
-    std::cout << "PASS: CSA polarity, configuration limits, 4326 transform checks, SVPWM bounds, PI anti-windup, angle wrapping, detents, endstops, damping, spring.\n";
+    std::cout << "PASS: CSA polarity, configuration/voltage limits, sector transforms, SVPWM voltage and duty bounds, PI anti-windup, angle wrapping, detents, endstops, damping, spring.\n";
 }

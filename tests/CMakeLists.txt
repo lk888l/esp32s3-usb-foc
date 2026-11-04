@@ -14,3 +14,58 @@ add_executable(speed_limit_tests speed_limit_tests.cpp ../components/knob_core/s
 target_include_directories(speed_limit_tests PRIVATE ../components/knob_core/include)
 target_compile_options(speed_limit_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 add_test(NAME haptic_speed_transitions COMMAND speed_limit_tests)
+
+add_executable(haptic_profile_tests haptic_profile_tests.cpp ../components/knob_core/src/control.cpp)
+target_include_directories(haptic_profile_tests PRIVATE ../components/knob_core/include)
+target_compile_options(haptic_profile_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME localized_detent_profile COMMAND haptic_profile_tests)
+
+add_executable(diagnostic_hold_tests diagnostic_hold_tests.cpp)
+target_include_directories(diagnostic_hold_tests PRIVATE ../components/knob_app/include ../components/knob_core/include)
+target_compile_options(diagnostic_hold_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME bounded_diagnostic_hold COMMAND diagnostic_hold_tests)
+
+add_executable(encoder_mailbox_tests encoder_mailbox_tests.cpp)
+target_include_directories(encoder_mailbox_tests PRIVATE ../components/knob_app/include ../components/knob_encoder/include)
+target_compile_options(encoder_mailbox_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME encoder_failure_mailbox COMMAND encoder_mailbox_tests)
+
+add_executable(settings_identity_tests settings_identity_tests.cpp ../components/knob_core/src/control.cpp)
+target_include_directories(settings_identity_tests PRIVATE ../components/knob_app/include ../components/knob_encoder/include ../components/knob_core/include)
+target_compile_options(settings_identity_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME encoder_calibration_identity COMMAND settings_identity_tests)
+
+add_executable(mt6701_tests mt6701_tests.cpp)
+target_include_directories(mt6701_tests PRIVATE ../components/knob_encoder/include)
+target_compile_options(mt6701_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME mt6701_ssi_frames COMMAND mt6701_tests)
+
+add_executable(mt6701_dma_tests mt6701_dma_tests.cpp ../components/knob_encoder/src/mt6701.cpp)
+target_include_directories(mt6701_dma_tests PRIVATE mt6701_stubs ../components/knob_encoder/include)
+target_compile_options(mt6701_dma_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME mt6701_dma_ownership COMMAND mt6701_dma_tests)
+
+add_executable(pwm_timing_tests pwm_timing_tests.cpp)
+target_include_directories(pwm_timing_tests PRIVATE ../components/knob_hal/include)
+target_compile_options(pwm_timing_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME pwm_latch_prediction COMMAND pwm_timing_tests)
+
+foreach(enabled IN ITEMS 0 1)
+    add_executable(bus_voltage_${enabled}_tests bus_voltage_monitor_tests.cpp ../components/knob_hal/src/bus_voltage.cpp)
+    target_include_directories(bus_voltage_${enabled}_tests PRIVATE bus_voltage_stubs ../components/knob_hal/include)
+    target_compile_definitions(bus_voltage_${enabled}_tests PRIVATE CONFIG_KNOB_BUS_VOLTAGE_SENSE=${enabled}
+        CONFIG_KNOB_BUS_DIVIDER_MILLI=11000 CONFIG_IDF_TARGET_ESP32S3=1)
+    target_compile_options(bus_voltage_${enabled}_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+    add_test(NAME bus_voltage_${enabled} COMMAND bus_voltage_${enabled}_tests)
+endforeach()
+
+# Voltage capability and all-sector modulation must agree with each selectable
+# hardware profile, not merely the default host compilation.
+foreach(profile IN ITEMS 5K70 20K70)
+    string(TOLOWER "${profile}" profile_suffix)
+    add_executable(control_${profile_suffix}_tests control_tests.cpp ../components/knob_core/src/control.cpp)
+    target_include_directories(control_${profile_suffix}_tests PRIVATE ../components/knob_core/include)
+    target_compile_definitions(control_${profile_suffix}_tests PRIVATE CONFIG_KNOB_PWM_${profile}=1)
+    target_compile_options(control_${profile_suffix}_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+    add_test(NAME foc_voltage_${profile_suffix} COMMAND control_${profile_suffix}_tests)
+endforeach()

@@ -2,6 +2,7 @@
 """Run one bounded on-board FreeRTOS drive/release test (diagnostic build only)."""
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 from knobctl import Knob
@@ -17,14 +18,19 @@ def main():
     parser.add_argument("--observe-ms", type=int, default=2500)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--require-cycle", action="store_true")
+    parser.add_argument("--max-tail-speed", type=float,
+                        help="Fail if peak speed in the last 500 ms exceeds this rad/s (unloaded settling check)")
     args = parser.parse_args()
+    if args.max_tail_speed is not None and (not math.isfinite(args.max_tail_speed) or args.max_tail_speed <= 0):
+        parser.error("--max-tail-speed must be finite and positive")
     request = dict(mode=args.mode, velocity=args.velocity, current=args.current,
                    drive_ms=args.drive_ms, observe_ms=args.observe_ms)
     device = Knob(args.port)
     device.serial.timeout = .005
     report = {"passed": False, "request": request, "samples": [],
               "columns": ["elapsed_us", "angle", "velocity", "target", "iq",
-                          "id_current", "haptic_scale", "voltage_q", "phase_peak", "flags", "velocity_fast"]}
+                          "id_current", "haptic_scale", "voltage_q", "phase_peak", "flags", "velocity_fast", "voltage_d",
+                          "adc_raw_a", "adc_raw_b", "sample_start_tick", "sample_end_tick"]}
     try:
         initial = device.request("status")
         report["initial"] = initial
@@ -59,6 +65,16 @@ def main():
             raise RuntimeError("Original configuration was not restored")
         if args.require_cycle and not (diagnostic["muted_samples"] > 0 and diagnostic["recovered"]):
             raise RuntimeError("No complete on-board mute/recovery cycle")
+        samples = report["samples"]
+        if samples:
+            tail = [row for row in samples if row[0] >= samples[-1][0] - 500000]
+            report["tail_peak_speed"] = max(abs(row[2]) for row in tail)
+            report["tail_angle_span"] = max(row[1] for row in tail) - min(row[1] for row in tail)
+        if args.max_tail_speed is not None:
+            if not samples or args.observe_ms < 1000:
+                raise RuntimeError("Settling check needs samples and at least 1000 ms observation")
+            if report["tail_peak_speed"] > args.max_tail_speed:
+                raise RuntimeError(f"Did not settle: tail peak {report['tail_peak_speed']:.3f} rad/s")
         report["passed"] = True
     except Exception as error:
         report["error"] = str(error)
