@@ -112,7 +112,7 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "id", id);
     cJSON_AddStringToObject(root, "device", "smartknob-s3");
     cJSON_AddNumberToObject(root, "protocol", 1);
-    cJSON_AddStringToObject(root, "firmware", "dma-v5-bus-sense");
+    cJSON_AddStringToObject(root, "firmware", "dma-v7-strength-range");
     cJSON_AddStringToObject(root, "pwm_profile", pwm_profile_name);
     const auto* app = esp_app_get_description();
     char app_sha256[65]{};
@@ -163,7 +163,7 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "bus_voltage_measured", s.bus_sample.volts);
     cJSON_AddNumberToObject(root, "bus_voltage_error", s.bus_sample.error);
     cJSON_AddNumberToObject(root, "bus_voltage_divider", BusVoltageMonitor::divider_ratio);
-    cJSON_AddStringToObject(root, "detent_profile", "localized_barrier");
+    cJSON_AddStringToObject(root, "detent_profile", "smart_knob");
     cJSON_AddBoolToObject(root, "detent_quiet_velocity", false);
     cJSON_AddBoolToObject(root, "haptic_position_filter", false);
     cJSON_AddBoolToObject(root, "current_target_slew", false);

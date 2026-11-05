@@ -18,7 +18,7 @@ add_test(NAME haptic_speed_transitions COMMAND speed_limit_tests)
 add_executable(haptic_profile_tests haptic_profile_tests.cpp ../components/knob_core/src/control.cpp)
 target_include_directories(haptic_profile_tests PRIVATE ../components/knob_core/include)
 target_compile_options(haptic_profile_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
-add_test(NAME localized_detent_profile COMMAND haptic_profile_tests)
+add_test(NAME smart_knob_detent_profile COMMAND haptic_profile_tests)
 
 add_executable(diagnostic_hold_tests diagnostic_hold_tests.cpp)
 target_include_directories(diagnostic_hold_tests PRIVATE ../components/knob_app/include ../components/knob_core/include)
