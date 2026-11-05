@@ -11,7 +11,7 @@ namespace knob {
 enum class Op { status, configure, calibrate, enable, disable, clear, zero, pulse, save,
     restart_sampling // Internal console request after NVS writes; never decoded from JSON.
 #if CONFIG_KNOB_DIAGNOSTICS
-    , diagnose, diagnostic_read, diagnostic_hold, test_begin, test_end
+    , diagnose, diagnostic_read, diagnostic_hold, diagnostic_restore_calibration, test_begin, test_end
 #endif
 };
 enum class State { idle, offsets, align, sweep, settle, active, fault };
@@ -20,6 +20,7 @@ struct Request {
     int id = 0; Op op = Op::status; Config config{}; bool renew_lease = true;
 #if CONFIG_KNOB_DIAGNOSTICS
     DiagnosticPlan diagnostic{};
+    Calibration diagnostic_calibration{};
     int diagnostic_offset = 0;
     bool test_command = false;
 #endif
@@ -34,10 +35,13 @@ struct Snapshot {
     int encoder_error = 0, fault_magnet = 0;
     uint32_t encoder_failures = 0, encoder_retries = 0;
     float angle = 0, velocity = 0, velocity_fast = 0, id = 0, iq = 0, target = 0, sub_position = 0;
+    float target_d = 0;
     std::array<float, 3> currents{}, volts{}, offsets{}, duty{};
     int position = 0, magnet = 0;
     bool current_valid = false;
     bool adc_sample_valid = false, sampling_restart_required = false;
+    uint8_t adc_reject_reasons = 0;
+    std::array<uint32_t, 6> adc_reject_counts{};
     BusVoltageSample bus_sample{};
     float bus_voltage_used = Config{}.bus_voltage;
     float effective_voltage_limit = 0;
@@ -45,12 +49,23 @@ struct Snapshot {
     bool bus_voltage_valid = false;
     uint32_t rejected = 0, reused_samples = 0;
     uint32_t missed_samples = 0, control_cycles = 0;
+    uint32_t timing_skips = 0, sampling_recoveries = 0, pwm_deferred = 0;
+    uint32_t adc_timing_skips = 0, encoder_timing_skips = 0;
+    float pwm_peak_duty = 0;
+    uint32_t pwm_full_duty_cycles = 0;
     float control_hz = 0, control_interval_us = 0, control_max_us = 0;
     int encoder_age_us = 0, encoder_age_max_us = 0;
     std::array<uint32_t, 2> adc_dma_words{};
+    std::array<uint32_t, 2> adc_current_words{};
     // Sampling experiment: preserve all pipeline slots and their PWM timing.
     std::array<uint32_t, 3> adc_slot_words{};
     std::array<int16_t, 3> adc_trigger_ticks{}, adc_callback_ticks{};
+    std::array<int16_t, 3> adc_done_ticks{};
+    std::array<uint32_t, 3> adc_done_words{};
+    std::array<uint32_t, 3> adc_armed_words{};
+    std::array<uint16_t, 3> adc_done_elapsed_us{};
+    uint8_t adc_done_mask = 0, adc_done_down_mask = 0;
+    uint8_t adc_done_raw_mask = 0;
     std::array<uint8_t, 3> adc_trigger_sar{}, adc_callback_sar{};
     std::array<uint16_t, 3> adc_callback_elapsed_us{};
     std::array<uint16_t, 3> adc_trigger_elapsed_us{};

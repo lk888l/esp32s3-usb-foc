@@ -1,4 +1,5 @@
 #include "settings_identity.hpp"
+#include <bit>
 #include <cassert>
 #include <iostream>
 
@@ -24,6 +25,18 @@ int main() {
         assert(!settings_calibration_matches(unknown, mt6701));
     }
     Config saved;
+    // Reproduce the pre-v8 record layout. Removing the public voltage knob
+    // must not shift PI/haptic fields or discard an existing calibration.
+    struct LegacyConfig {
+        float bus_voltage, sense_gain, current_limit, voltage_limit;
+        float current_kp, current_ki, width, strength, endstop, damping, snap;
+        int min_position, max_position;
+        Mode mode;
+    };
+    static_assert(sizeof(LegacyConfig) == sizeof(Config));
+    const LegacyConfig legacy{12, .15f, .7f, 7.8f, .6f, 180, .2f, 6.5f, 8, .03f, .55f, 0, 11, Mode::spring};
+    saved = std::bit_cast<Config>(legacy);
+    assert(saved.legacy_voltage_limit == 7.8f && saved.current_kp == .6f && saved.current_ki == 180);
     saved.strength = 6.5f;
     saved.current_limit = .7f;
     saved.width = .2f;
@@ -36,6 +49,9 @@ int main() {
             assert(restore_encoder_settings(version, saved, saved_calibration, selected, restored, calibration));
             assert(restored.strength == saved.strength && restored.current_limit == saved.current_limit);
             assert(restored.width == saved.width && restored.mode == saved.mode);
+            assert(restored.legacy_voltage_limit == 7.8f);
+            assert(restored.current_kp == .6f && restored.current_ki == 180);
+            assert(max_output_voltage(restored.bus_voltage) > 0);
             const bool matches = settings_calibration_matches(version, selected);
             assert(calibration.valid == matches);
             if (matches) {
@@ -54,5 +70,5 @@ int main() {
     assert(restored.strength == Config{}.strength && !calibration.valid);
     assert(!restore_encoder_settings(99, saved, saved_calibration, mt6701, restored, calibration));
     assert(restored.strength == Config{}.strength && !calibration.valid);
-    std::cout << "PASS: legacy and sensor-specific calibration identities.\n";
+    std::cout << "PASS: legacy settings layout, retired voltage limit, and sensor-specific calibration identities.\n";
 }

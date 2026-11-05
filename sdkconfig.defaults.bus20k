@@ -1,9 +1,12 @@
-# Experimental profile for the confirmed H1-10 -> GPIO11 bench wiring.
+# ADC-window-constrained SVPWM for the confirmed H1-10 -> GPIO11 bench wiring.
 # Apply after sdkconfig.defaults, using a fresh SDKCONFIG path.
 # 20 kHz load-current tracking and acoustic performance remain unqualified.
 # CONFIG_KNOB_PWM_10K50 is not set
 # CONFIG_KNOB_PWM_5K70 is not set
-CONFIG_KNOB_PWM_20K70=y
+# CONFIG_KNOB_PWM_20K70 is not set
+# CONFIG_KNOB_PWM_20K100 is not set
+# CONFIG_KNOB_PWM_20K90 is not set
+CONFIG_KNOB_PWM_20K65=y
 CONFIG_KNOB_CONTROL_5KHZ=y
 CONFIG_KNOB_BUS_VOLTAGE_SENSE=y
 CONFIG_KNOB_BUS_DIVIDER_MILLI=11000

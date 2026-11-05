@@ -19,7 +19,7 @@ const char* state_name(State s) {
 namespace {
 struct Field { const char* name; float Config::*member; };
 constexpr Field fields[] = {{"bus_voltage", &Config::bus_voltage}, {"sense_gain", &Config::sense_gain},
-    {"current_limit", &Config::current_limit}, {"voltage_limit", &Config::voltage_limit},
+    {"current_limit", &Config::current_limit},
     {"current_kp", &Config::current_kp}, {"current_ki", &Config::current_ki}, {"width", &Config::width},
     {"strength", &Config::strength}, {"endstop", &Config::endstop}, {"damping", &Config::damping}, {"snap", &Config::snap}};
 void array(cJSON* obj, const char* name, const std::array<float, 3>& values) {
@@ -48,13 +48,30 @@ const char* decode_request(const char* line, Request& r) {
     constexpr NamedOp names[] = {{"status", Op::status}, {"configure", Op::configure}, {"calibrate", Op::calibrate},
         {"enable", Op::enable}, {"disable", Op::disable}, {"clear", Op::clear}, {"zero", Op::zero}, {"pulse", Op::pulse}, {"save", Op::save}
 #if CONFIG_KNOB_DIAGNOSTICS
-        , {"diagnose", Op::diagnose}, {"diagnostic_read", Op::diagnostic_read}, {"diagnostic_hold", Op::diagnostic_hold}
+        , {"diagnose", Op::diagnose}, {"diagnostic_read", Op::diagnostic_read}, {"diagnostic_hold", Op::diagnostic_hold},
+        {"diagnostic_restore_calibration", Op::diagnostic_restore_calibration}
 #endif
     };
     bool found = false;
     for (auto n : names) if (!std::strcmp(op->valuestring, n.name)) { r.op = n.op; found = true; }
     if (!found) return fail("unknown_op");
 #if CONFIG_KNOB_DIAGNOSTICS
+    if (r.op == Op::diagnostic_restore_calibration) {
+        const auto* encoder = cJSON_GetObjectItemCaseSensitive(root, "encoder");
+        const auto* cal = cJSON_GetObjectItemCaseSensitive(root, "calibration");
+        if (!cJSON_IsString(encoder) || std::strcmp(encoder->valuestring, encoder_config::name) ||
+            !cJSON_IsObject(cal)) return fail("calibration_identity");
+        const auto* valid = cJSON_GetObjectItemCaseSensitive(cal, "valid");
+        const auto* direction = cJSON_GetObjectItemCaseSensitive(cal, "direction");
+        const auto* poles = cJSON_GetObjectItemCaseSensitive(cal, "pole_pairs");
+        const auto* zero = cJSON_GetObjectItemCaseSensitive(cal, "electrical_zero");
+        if (!cJSON_IsTrue(valid) || !cJSON_IsNumber(direction) || !cJSON_IsNumber(poles) ||
+            !cJSON_IsNumber(zero) || !std::isfinite(zero->valuedouble) ||
+            (direction->valuedouble != -1 && direction->valuedouble != 1) || poles->valuedouble != 7)
+            return fail("invalid_calibration");
+        r.diagnostic_calibration = {true, direction->valueint, poles->valueint, static_cast<float>(zero->valuedouble)};
+        if (!valid_calibration(r.diagnostic_calibration)) return fail("invalid_calibration");
+    }
     if (r.op == Op::diagnostic_hold) {
         const auto* current = cJSON_GetObjectItemCaseSensitive(root, "current");
         if (!cJSON_IsNumber(current) || !std::isfinite(current->valuedouble) ||
@@ -63,20 +80,29 @@ const char* decode_request(const char* line, Request& r) {
         r.diagnostic.current = static_cast<float>(current->valuedouble);
     }
     if (r.op == Op::diagnose) {
+        const auto* axis = cJSON_GetObjectItemCaseSensitive(root, "axis");
+        if (axis && (!cJSON_IsString(axis) ||
+            (std::strcmp(axis->valuestring, "d") && std::strcmp(axis->valuestring, "q"))))
+            return fail("diagnostic_axis");
+        const bool d_axis = axis && !std::strcmp(axis->valuestring, "d");
         const char* keys[] = {"mode", "velocity", "current", "drive_ms", "observe_ms"};
         double values[5]{};
         for (int i = 0; i < 5; ++i) {
             const auto* item = cJSON_GetObjectItemCaseSensitive(root, keys[i]);
+            // Positive d injection needs no velocity stimulus or haptic mode.
+            if (d_axis && !item && i < 2) continue;
             if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble)) return fail("diagnostic_fields_required");
             values[i] = item->valuedouble;
         }
         if (values[0] < 0 || values[0] > 3 || std::floor(values[0]) != values[0] ||
-            std::abs(values[1]) < 10 || std::abs(values[1]) > 60 ||
-            values[2] < .02 || values[2] > .25 ||
-            values[3] < 50 || values[3] > 500 || values[4] < 500 || values[4] > 3000)
+            (d_axis ? values[1] != 0 : std::abs(values[1]) < 10 || std::abs(values[1]) > 60) ||
+            values[2] < (d_axis ? .05 : .02) || values[2] > (d_axis ? 3 : .25) ||
+            values[3] < 50 || values[3] > (d_axis ? 30000 : 500) ||
+            values[4] < (d_axis ? 100 : 500) || values[4] > (d_axis ? 1000 : 3000))
             return fail("diagnostic_range");
         r.diagnostic = {static_cast<Mode>(static_cast<int>(values[0])), static_cast<float>(values[1]),
-            static_cast<float>(values[2]), static_cast<int>(values[3] * 1000), static_cast<int>(values[4] * 1000)};
+            static_cast<float>(values[2]), static_cast<int>(values[3] * 1000), static_cast<int>(values[4] * 1000),
+            d_axis ? DiagnosticAxis::d : DiagnosticAxis::q};
     }
     if (r.op == Op::diagnostic_read) {
         const auto* item = cJSON_GetObjectItemCaseSensitive(root, "offset");
@@ -89,6 +115,9 @@ const char* decode_request(const char* line, Request& r) {
     if (r.op == Op::configure) {
         const auto* c = cJSON_GetObjectItemCaseSensitive(root, "config");
         if (!cJSON_IsObject(c)) return fail("config_required");
+        // Voltage capacity follows the live bus. Reject an old client's knob
+        // explicitly, instead of silently pretending that its limit applies.
+        if (cJSON_GetObjectItemCaseSensitive(c, "voltage_limit")) return fail("voltage_limit_automatic");
         // Complete replacements avoid lost partial updates across reconnects.
         for (auto f : fields) {
             const auto* item = cJSON_GetObjectItemCaseSensitive(c, f.name);
@@ -112,7 +141,7 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "id", id);
     cJSON_AddStringToObject(root, "device", "smartknob-s3");
     cJSON_AddNumberToObject(root, "protocol", 1);
-    cJSON_AddStringToObject(root, "firmware", "dma-v7-strength-range");
+    cJSON_AddStringToObject(root, "firmware", "dma-v16-coherent-adc");
     cJSON_AddStringToObject(root, "pwm_profile", pwm_profile_name);
     const auto* app = esp_app_get_description();
     char app_sha256[65]{};
@@ -123,11 +152,25 @@ cJSON* encode_reply(int id, const Reply& r) {
     }
     cJSON_AddStringToObject(root, "app_elf_sha256", app_sha256);
     cJSON_AddStringToObject(root, "current_sampling", Board::staggered_sampling ?
-        "pwm_staggered_adc_gdma_experimental" : "pwm_triggered_adc_gdma");
+        "pwm_staggered_adc_done_experimental" : "pwm_triggered_adc_gdma");
     cJSON_AddNumberToObject(root, "current_phase_skew_us", s.phase_skew_us);
     cJSON_AddBoolToObject(root, "adc_sample_valid", s.adc_sample_valid);
+    cJSON_AddNumberToObject(root, "adc_reject_reasons", s.adc_reject_reasons);
+    cJSON* reject_counts = cJSON_AddObjectToObject(root, "adc_reject_counts");
+    constexpr const char* reject_names[] = {
+        "transport", "trigger", "pwm_tracking", "burst_timing", "phase_window", "pair_change"};
+    for (size_t i = 0; i < s.adc_reject_counts.size(); ++i)
+        cJSON_AddNumberToObject(reject_counts, reject_names[i], s.adc_reject_counts[i]);
     cJSON_AddBoolToObject(root, "sampling_restart_required", s.sampling_restart_required);
     cJSON_AddNumberToObject(root, "adc_completed_mask", s.adc_completed_mask);
+    cJSON_AddNumberToObject(root, "adc_done_mask", s.adc_done_mask);
+    cJSON_AddNumberToObject(root, "adc_done_raw_mask", s.adc_done_raw_mask);
+    cJSON_AddNumberToObject(root, "adc_done_down_mask", s.adc_done_down_mask);
+    numeric_array(root, "adc_done_ticks", s.adc_done_ticks);
+    numeric_array(root, "adc_done_words", s.adc_done_words);
+    numeric_array(root, "adc_armed_words", s.adc_armed_words);
+    numeric_array(root, "adc_current_words", s.adc_current_words);
+    numeric_array(root, "adc_done_elapsed_us", s.adc_done_elapsed_us);
     cJSON_AddNumberToObject(root, "adc_window_after_mask", s.adc_window_after_mask);
     numeric_array(root, "adc_trigger_elapsed_us", s.adc_trigger_elapsed_us);
     auto* before = cJSON_AddArrayToObject(root, "adc_pwm_compare_before");
@@ -149,7 +192,8 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "pwm_min_active_duty", duty_floor);
     cJSON_AddBoolToObject(root, "pwm_zero_clamp", pwm_zero_clamp);
     cJSON_AddNumberToObject(root, "pwm_duty_ceiling", duty_ceiling);
-    cJSON_AddNumberToObject(root, "max_voltage_limit", max_output_voltage(s.config.bus_voltage));
+    cJSON_AddBoolToObject(root, "voltage_limit_automatic", true);
+    cJSON_AddNumberToObject(root, "max_voltage_limit", max_output_voltage(s.bus_voltage_used));
     cJSON_AddNumberToObject(root, "available_voltage_limit", max_output_voltage(s.bus_voltage_used));
     cJSON_AddNumberToObject(root, "configured_max_voltage_limit", max_output_voltage(s.config.bus_voltage));
     cJSON_AddNumberToObject(root, "effective_voltage_limit", s.effective_voltage_limit);
@@ -223,6 +267,8 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddStringToObject(root, "fault", s.fault);
 #if CONFIG_KNOB_DIAGNOSTICS
     cJSON* diagnostic = cJSON_AddObjectToObject(root, "diagnostic");
+    cJSON_AddStringToObject(diagnostic, "axis", s.diagnostic.axis == DiagnosticAxis::d ? "d" : "q");
+    cJSON_AddStringToObject(diagnostic, "reference", s.diagnostic.axis == DiagnosticAxis::d ? "fixed_start_angle" : "rotor");
     cJSON_AddBoolToObject(diagnostic, "busy", s.diagnostic.busy);
     cJSON_AddBoolToObject(diagnostic, "cancelled", s.diagnostic.cancelled);
     cJSON_AddNumberToObject(diagnostic, "stage", s.diagnostic.stage);
@@ -239,8 +285,10 @@ cJSON* encode_reply(int id, const Reply& r) {
             const double row[] = {double(v.elapsed_us), v.angle, v.velocity, v.target, v.iq, v.id,
                                   v.scale, v.voltage_q, v.phase_peak, double(v.flags), v.velocity_fast, v.voltage_d,
                                   double(v.adc_raw_a), double(v.adc_raw_b),
-                                  double(v.sample_start_tick), double(v.sample_end_tick)};
-            cJSON_AddItemToArray(samples, cJSON_CreateDoubleArray(row, 16));
+                                  double(v.sample_start_tick), double(v.sample_end_tick), v.target_d};
+            // Keep the legacy q trace layout; d tests append their actual Id target.
+            cJSON_AddItemToArray(samples, cJSON_CreateDoubleArray(row,
+                s.diagnostic.axis == DiagnosticAxis::d ? 17 : 16));
         }
     }
 #endif
@@ -257,10 +305,18 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "position", s.position); cJSON_AddNumberToObject(root, "sub_position", s.sub_position);
     cJSON_AddNumberToObject(root, "iq", s.iq); cJSON_AddNumberToObject(root, "id_current", s.id);
     cJSON_AddNumberToObject(root, "target", s.target); cJSON_AddNumberToObject(root, "magnet", s.magnet);
+    cJSON_AddNumberToObject(root, "target_d", s.target_d);
     cJSON_AddBoolToObject(root, "current_valid", s.current_valid);
     cJSON_AddNumberToObject(root, "rejected_samples", s.rejected);
     cJSON_AddNumberToObject(root, "reused_samples", s.reused_samples);
     cJSON_AddNumberToObject(root, "missed_samples", s.missed_samples);
+    cJSON_AddNumberToObject(root, "timing_skips", s.timing_skips);
+    cJSON_AddNumberToObject(root, "adc_timing_skips", s.adc_timing_skips);
+    cJSON_AddNumberToObject(root, "encoder_timing_skips", s.encoder_timing_skips);
+    cJSON_AddNumberToObject(root, "sampling_recoveries", s.sampling_recoveries);
+    cJSON_AddNumberToObject(root, "pwm_deferred", s.pwm_deferred);
+    cJSON_AddNumberToObject(root, "pwm_peak_duty", s.pwm_peak_duty);
+    cJSON_AddNumberToObject(root, "pwm_full_duty_cycles", s.pwm_full_duty_cycles);
     cJSON_AddNumberToObject(root, "control_cycles", s.control_cycles);
     cJSON_AddNumberToObject(root, "control_hz", s.control_hz);
     cJSON_AddNumberToObject(root, "control_interval_us", s.control_interval_us);

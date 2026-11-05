@@ -12,19 +12,14 @@ float max_output_voltage(float bus_voltage) {
     const float span = pwm_zero_clamp ? duty_ceiling : duty_ceiling - duty_floor;
     return bus_voltage * span / 1.7320508f;
 }
-float effective_voltage_limit(float requested_limit, float bus_voltage) {
-    if (!std::isfinite(requested_limit) || requested_limit <= 0) return 0;
-    return std::min(requested_limit, max_output_voltage(bus_voltage));
-}
 const char* validate(const Config& c)
 {
-    const float values[] = {c.bus_voltage, c.sense_gain, c.current_limit, c.voltage_limit,
+    const float values[] = {c.bus_voltage, c.sense_gain, c.current_limit,
                            c.current_kp, c.current_ki, c.width, c.strength, c.endstop, c.damping, c.snap};
     for (float v : values) if (!std::isfinite(v)) return "non_finite";
     if (c.bus_voltage < 4.5f || c.bus_voltage > 30) return "bus_voltage_range";
     if (c.sense_gain != 0.15f && c.sense_gain != 0.3f && c.sense_gain != 0.6f && c.sense_gain != 1.2f) return "sense_gain_invalid";
     if (c.current_limit < 0.02f || c.current_limit > max_motor_current) return "current_limit_range";
-    if (c.voltage_limit < 0.05f || c.voltage_limit > max_output_voltage(c.bus_voltage)) return "voltage_limit_range";
     if (c.current_kp < 0 || c.current_kp > 20 || c.current_ki < 0 || c.current_ki > 1000) return "pi_range";
     if (c.width < pi / 180 || c.width > pi || c.snap < 0.5f || c.snap > 1) return "detent_range";
     if (c.strength < 0 || c.strength > max_haptic_strength || c.endstop < 0 || c.endstop > 20 || c.damping < 0 || c.damping > 0.5f) return "haptic_range";
@@ -65,13 +60,30 @@ Dq park(const std::array<float, 3>& i, float a) {
     return {alpha * c + beta * s, -alpha * s + beta * c};
 }
 std::array<float, 3> svpwm(Dq v, float a, float bus) {
-    if (!std::isfinite(v.d) || !std::isfinite(v.q) || !std::isfinite(a) || !std::isfinite(bus) || bus < 4.5f)
+    if (!std::isfinite(v.d) || !std::isfinite(v.q) || !std::isfinite(a) ||
+        !std::isfinite(bus) || bus < 4.5f || bus > 30.0f)
         return {duty_floor, duty_floor, duty_floor};
+    // Avoid overflow before the overmodulation limiter, even for finite but
+    // extreme requests. Any vector this large already exceeds the hexagon;
+    // uniform pre-scaling preserves its direction and final duty ratios.
+    const float magnitude = std::max(std::abs(v.d), std::abs(v.q));
+    if (magnitude > bus) { v.d = v.d / magnitude * bus; v.q = v.q / magnitude * bus; }
+    a = wrap(a);
+    if (!std::isfinite(a) || a < 0 || a >= tau) return {duty_floor, duty_floor, duty_floor};
     const float alpha = v.d * fast_cos(a) - v.q * fast_sin(a);
     const float beta = v.d * fast_sin(a) + v.q * fast_cos(a);
     std::array<float, 3> phases{alpha, -0.5f * alpha + 0.8660254f * beta, -0.5f * alpha - 0.8660254f * beta};
     const auto [lo, hi] = std::minmax_element(phases.begin(), phases.end());
     const float minimum = *lo, span = *hi - minimum;
+    if constexpr (pwm_zero_floor) {
+        // Discontinuous SVPWM (DPWM0): put the entire zero-vector dwell at
+        // 000. Common-mode subtraction preserves every phase difference and
+        // maximizes low-side conduction. Scale over-range vectors uniformly
+        // to the selected sampling ceiling without imposing a pulse floor.
+        const float scale = span > bus * duty_ceiling ? duty_ceiling / span : 1.0f / bus;
+        for (float& phase : phases) phase = std::clamp((phase - minimum) * scale, 0.0f, duty_ceiling);
+        return phases;
+    }
     if constexpr (pwm_zero_clamp) {
         // Clamp the minimum phase low when both remaining pulses are long
         // enough. Near a sector boundary, shift all three pulses up instead;

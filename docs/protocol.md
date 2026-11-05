@@ -1,6 +1,90 @@
 # SmartKnob USB 协议 v1
 
-## 2026-11-04 v7 强度上限扩展
+## 2026-11-05 v16：转换完成校验与一致的两相采样
+
+当前源码报告 `firmware:"dma-v16-coherent-adc"`，默认 `pwm_profile:"20k65_sampling"`，协议仍为 v1。20 kHz 中心对齐 PWM 的 duty 为 0–65%，零脉宽下限仍为 0；活动电流环的电压能力为 **`0.65 × 有效实测母线 / √3`**。12 V 时约 4.503 V，相比 v10 的 90% 能力降低约 27.8%。这是当前采样时序允许的配置，不是 SVPWM 数学极限。90% / 100% 仍为显式实验选项，客户端必须读取实际 profile 和能力字段。
+
+默认 20 kHz 路径的 `current_sampling` 为 `pwm_staggered_adc_done_experimental`。SAR ADC 时钟为 5 MHz；实际 START 目标位于 TEZ 前 2.25 µs，低侧建立预算仍为 6 µs，上升沿保护仍为 1 µs。完成窗口改用与本次 START 关联的独立 ADC1_DONE ISR 观测。DMA 回调用于数据传输和阶段推进，不再当成本次转换的完成上界。DONE ISR 也包含中断延迟，仍是保守观测，并非模拟采样孔径。
+
+| 字段 | v16 含义 |
+|---|---|
+| `adc_done_ticks[3]` / `adc_done_down_mask` | 每个 START 对应 DONE ISR 读取的 PWM 计数 / 向下计数位图；80 tick = 1 µs |
+| `adc_done_elapsed_us[3]` | 从采样组首个 START 至各槽 DONE ISR 的观测时间，含中断延迟；各槽自身的延迟为该值减去 `adc_trigger_elapsed_us[i]` |
+| `adc_done_mask` | 已捕获 DONE 的 START 槽位图；两份有效电流要求低两位齐全，第三槽负责冲刷 DMA 流水线，发布时不要求其 DONE 已到达 |
+| `adc_done_raw_mask` | DMA 回调入口时 ADC1_DONE 原始标志的槽位图，仅用于诊断 DMA / DONE 的相对时序 |
+| `adc_done_words[3]` | DONE ISR 读到的原始数据寄存器；仅低 12 位作为当前完成转换值，上位通道位可能已指向下一通道 |
+| `adc_armed_words[3]` | 每次 START 前读到的寄存器，用其预装通道标签验证该 START 的测量相 |
+| `adc_current_words[2]` | 两份经验证的有用 DMA 字：其低 12 位须等于对应 DONE 原始值，通道须等于该 START 前的 armed 通道；用于实际相电流和相窗口检查 |
+| `control_interval_us` | 两次被控制环接受的反馈之间的实际时间，不截断遥测值；PI、滤波及手感包络使用 `min(实际间隔, 2 ms)`。拒绝的原始帧不再把下一次有效控制的 dt 重置成 200 µs，原始帧的过流/限流证据仍单独按原始帧时间处理 |
+
+`adc_reject_counts` 沿用下方位定义；数据绑定不一致按传输完整性失败处理，所有物理窗口和跨相指令一致性检查继续生效。非零 PWM 指令若在第一相完成、第二相尚未完成时到达，会延后一个载波周期；电角度预测同时增加 50 µs。延后命令绑定预计生效序号，到期仍被采样占用或已经过期便丢弃，零输出不受此限制。`pwm_deferred` 只统计提交超时后等待下次控制重试的次数，成功入队的主动延后不增加它；`pwm_apply_delay_us` 可观察已接受命令的预计生效延迟。
+
+电流参数、诊断 `target_d` / 固定参考系语义和 NVS 布局保持兼容。根因、预算推导、实机记录与验证边界见[采样时序修复记录](sampling-contract-20261105.md)。下方各版本的默认值与 DMA 完成假设属于历史记录。
+
+## 2026-11-05 v10：90% 电压能力与固定参考系注流（历史）
+
+v10 源码报告 `firmware:"dma-v10-windowed-svpwm"`，默认 `pwm_profile:"20k90_svpwm"`，协议仍为 v1。`pwm_duty_floor=0`、`pwm_duty_ceiling=0.9`，最低相钳零。独立的零脉宽下限策略避免降占空比时恢复历史配置的 4% 下限。
+
+`max_voltage_limit`、`available_voltage_limit`、`effective_voltage_limit` 的当前默认能力均为 `0.9 × bus_voltage / √3`；有效母线 12 V 时约为 6.235383 V。`configured_max_voltage_limit` 采用同一比例和名义 `config.bus_voltage`，仅供参考。无效母线时可用能力为 0。`voltage_limit_automatic` 仍为 true，`config.voltage_limit` 仍被拒绝；比例是编译配置，不是新增的可写协议字段。
+
+显式构建 `20k65_sampling` 时使用 `0.65 × bus_voltage / √3`、0–65% duty；`20k100_svpwm` 则为 `bus_voltage / √3`、0–100%。客户端应读取实际 profile、duty 和能力字段，不能只靠 firmware 字符串推断比例。占空比下调不替代实际相窗口检查，90% 也不保证高电流时采样持续有效。
+
+顶层新增 `target_d`，表示经过限流后的 d 轴目标 A。普通手感的 `target` 继续使用原有机械方向 q 轴目标语义。诊断对象新增 `axis`（`"q"` / `"d"`）及 `reference`；d 轴测试为 `"fixed_start_angle"`，其 `id_current`、`iq`、`voltage_d`、`voltage_q` 对应该固定电角度，不能解释成转子发生偏移后的实时转子 dq 分量。固定参考系注流和仅恢复 RAM 校准的接口见文末“可选板上诊断构建”。
+
+## 2026-11-05 v9 采样拒绝原因与跳过来源
+
+v9 `firmware:"dma-v9-sampling-fix"` 保留了 v8 的调制、电压能力和协议版本，修复第一槽跨 TEZ 正常锁存新 PWM 指令时的误拒绝；v10 沿用该修复和以下计数字段。首槽旧下降沿与新上升沿仍分别检查；指令一致性检查为 `after[0] == before[1] == after[1]`，不再额外要求首槽 `before[0] == after[0]`。
+
+`enable` / `calibrate` 进入零输出 offsets 时不再要求最新一帧物理有效；采样必须晚于重建边界、时间戳不在未来、年龄不超过 2 ms 且传输未失步。随后仍只消费有效样本，等待桥唤醒和每相至少 128 份合格零偏样本后才能进入 active/align。这样避免一帧偶发迟到造成整个准备流程取消；持续无效反馈不会被接纳为零偏或电流。
+
+`rejected_samples` 是 HAL 拒绝的采样组总数，既包含真实窗口不足，也包含软件时序/完整性判断；不能标成“ADC 硬件转换失败”。新增字段如下：
+
+| 字段 | 含义 |
+|---|---|
+| `adc_reject_reasons` | 最近一组 HAL 样本的原因位掩码；通过 HAL 时为 0，位定义见下表 |
+| `adc_reject_counts` | 按原因累计的对象；一组可命中多个原因，不能将各项求和作为总拒绝数 |
+| `adc_timing_skips` | ADC 样本无效、过旧或长期未更新造成的控制跳过次数 |
+| `encoder_timing_skips` | 编码器超过 2 ms 预测时限、尚未到 10 ms 丢失故障时限的控制等待次数 |
+| `timing_skips` | 保留兼容，等于上述两类控制跳过次数之和；和 HAL 拒绝次数不是同一口径 |
+
+| 位值 / `adc_reject_counts` 键 | HAL 拒绝原因 |
+|---|---|
+| 1 / `transport` | 无法完成传输、帧长度/通道不合法、阶段所有权不一致、重复相或完成掩码不完整；不直接等同于 ADC 硬件损坏 |
+| 2 / `trigger` | START 方向/时刻不合要求或启动时 SAR 忙 |
+| 4 / `pwm_tracking` | 无法可靠关联实际锁存的 PWM 比较值或载波序号 |
+| 8 / `burst_timing` | 回调时 SAR 忙、回调间隔过长，或采样组顺序/总时长不合要求 |
+| 16 / `phase_window` | 实际测量相未通过固件的低侧建立/完成窗口预算，或完成位置无法证明窗口成立；不是 ADC 转换错误标志 |
+| 32 / `pair_change` | 两次有效相采样之间 PWM 指令发生变化 |
+
+HAL 原因计数和 `rejected_samples` 一样跨采样硬件重建保留、重启清零。`adc_sample_valid` 还考虑应用层重建后的样本时间边界，因此不能仅用 `adc_reject_reasons == 0` 推断应用层已经接受样本。比对计数时应使用同一固件运行区间的增量。验证工具 `tools/sampling_health_check.py` 同时检查拒绝比例、有效控制频率、故障及清理结果；`passed:true` 不代表高占空比或外部电流精度验证。
+
+窗口规则目前使用 6 µs 软件建立预算和 DMA 回调时刻作为完成上界。前者不是本轮实测的模拟建立时间，后者包含软件中断延迟，不是 ADC 采样孔径；因此这些检查有保守性。`phase_window` 表示无法按当前规则接受这组测量，不能单独证明 ADC 数据物理错误。未经边界波形和电流可信度验证，不能仅将该位清零后接受反馈。
+
+## 2026-11-05 v8 自动最大电压与时序容错（历史默认）
+
+`firmware:"dma-v8-full-svpwm"` 默认报告 `pwm_profile:"20k100_svpwm"`，线性 SVPWM 使用 0–100% 软件占空比范围。`config` 不再包含 `voltage_limit`；完整配置也不需要该字段。旧客户端提交该字段时返回 `ok:false,error:"voltage_limit_automatic"`，配置和校准保持原值。客户端应删除电压上限输入控件，按只读 `effective_voltage_limit` 显示当前能力。
+
+| 字段 | v8/v9 全范围配置含义（当前默认能力见 v10） |
+|---|---|
+| `voltage_limit_automatic` | true；电压能力由使用中的母线与调制范围计算，没有用户设定值 |
+| `pwm_duty_floor` / `pwm_duty_ceiling` | 默认完整范围为 0 / 1；实际指令仍由电流闭环计算 |
+| `max_voltage_limit` / `available_voltage_limit` / `effective_voltage_limit` | 默认完整 SVPWM 时均为 `bus_voltage / √3`，有效母线 12 V 对应约 6.928 V；无效母线时为 0 |
+| `configured_max_voltage_limit` | 兼容保留的名义 `config.bus_voltage` 对应能力，仅供参考，不限制实测母线下的输出 |
+| `timing_skips` | 因样本窗口、时效或调度条件不适用而跳过控制更新的累计次数，包括编码器短时过期的暂停周期 |
+| `sampling_recoveries` | 连续无效 ADC 反馈或编码器短时过期触发零电压矢量恢复的累计次数；桥保持使能，有效反馈恢复后自动继续闭环 |
+| `pwm_deferred` | 未赶上 PWM 安全提交时刻而延后本次输出更新的累计次数 |
+| `pwm_peak_duty` | 从启动或采样硬件重建以来，HAL 按实际 TEZ 锁存的比较值统计到的最高占空比；不是尚未应用的 PI 指令 |
+| `pwm_full_duty_cycles` | 同一统计期间内至少一相实际锁存为 100% 比较值的 PWM 周期数；不能替代驱动器输出波形测量 |
+
+本工程默认启用已接线的 GPIO11 母线采样，每次控制使用当前有效实测值，最大电压能力随供电升降。关闭采样的构建只能使用 `config.bus_voltage`，无法检测真实供电波动。校准仍使用最多 0.8 V 的独立对齐限制。电压字段都是软件 dq 指令幅值，不是电机端电压外部测量；100% PWM 不等于 dq 电压幅值等于母线电压。
+
+采样按两个实际测量相各自的低侧窗口校验，第三相由电流和为零重建。窗口不足的反馈不进入 PI，不清除既有过流暴露证据。偶发窗口或控制周期波动不再锁存 `adc_window_or_control_deadline`；连续无效超过约 2 ms 时请求零矢量恢复采样，保持桥使能，恢复后继续调节。这种恢复可能降低持续难采样角度下的平均输出，不能把 0–100% 指令范围解释为已保证连续 100% 实际输出。默认 20 kHz ADC 路径保留迟到回调所属 START，等待并完成原突发，超过 10 ms 仍未完成才标记失步并报告 `adc_transport_failure`；真实过流、无效/过期母线、编码器异常和控制任务真正停滞仍保留保护。
+
+旧 NVS 中原电压字段的字节保留用于布局与 CRC 兼容，但不参与校验和调制；其值不会重新成为限幅，也不会导致旧校准被丢弃。以下版本变更与实机记录保留历史语境，旧版本电压参数不适用于 v8。
+
+编码器样本年龄超过 2 ms 时同样暂停控制并请求零矢量，收到新鲜帧后继续；超过 10 ms 仍报告 `encoder_stale`。传输、CRC、磁场或角度跳变错误保留各自故障，不能作为普通调度波动忽略。
+
+## 2026-11-04 v7 强度上限扩展（历史）
 
 当前构建 `firmware:"dma-v7-strength-range"` 将 `strength_max` 从 100 扩展至 **1000 A/rad**，`detent_profile` 继续为 `smart_knob`。`current_limit_max` 仍为 4.5 A，默认强度、电流、电压、PI、速度及过流保护均不因范围扩展而自动改变。上位机须按 `strength_max` 决定允许输入的范围；仅升级上位机时，旧固件仍会拒绝超过其上限的强度。
 
@@ -43,11 +127,11 @@ v6 已通过 14/14 桌面回归、ESP-IDF 构建并烧录 COM7，运行 ELF SHA2
 
 新增 `dma-v5-bus-sense` 系列固件，协议版本仍为 1。用户已确认驱动板 H1-10 接到 GPIO11；ADC2_CH0 母线遥测约 19.43–19.47 V，与用户报告的 19.4 V 供电接近。驱动板 47 kΩ / 4.7 kΩ 分压的换算倍率为 **11**；接线、原理图依据及板上读回见[硬件记录](hardware.md#2026-11-04-新增母线电压采样)。该范围为实机快照观测，不是外部仪器标定结果。
 
-`config.bus_voltage` 继续表示名义母线配置，范围 4.5–30 V；启用母线采样后，实际调制使用顶层 `bus_voltage`，配置不会被每次 ADC 读数覆盖，也不会自动写入 NVS。可配置电压上限和实时可用电压分别报告，避免客户端将实测母线波动误解成配置变更。
+`config.bus_voltage` 继续表示名义母线配置，范围 4.5–30 V；启用母线采样后，实际调制使用顶层 `bus_voltage`，配置不会被每次 ADC 读数覆盖，也不会自动写入 NVS。以下母线字段延续到 v8，电压能力已改为自动最大值。
 
 | 字段 | 含义 |
 |---|---|
-| `bus_voltage_sensing` | 是否编译启用 GPIO11 母线采样；通用 Kconfig 默认关闭，接线后的现场构建启用 |
+| `bus_voltage_sensing` | 是否编译启用 GPIO11 母线采样；v8 本工程针对已确认接线默认开启 |
 | `bus_voltage_source` | 启用时为 `adc2_gpio11`；关闭时为 `configured` |
 | `bus_voltage` | 当前调制所使用的母线 V；采样开启且读数无效时为 0，不回退到配置值 |
 | `bus_voltage_valid` | 最新采样有效、读取成功、时间戳有效且年龄不超过 100 ms；关闭采样时表示配置母线有效 |
@@ -56,11 +140,11 @@ v6 已通过 14/14 桌面回归、ESP-IDF 构建并烧录 COM7，运行 ELF SHA2
 | `bus_voltage_raw` / `bus_voltage_adc_mv` | GPIO11 原始 12 位 ADC 码 / 校准后的引脚 mV；不是相电流 ADC 数据 |
 | `bus_voltage_error` | 最近读取或初始化的 ESP-IDF 错误码，0 表示成功；无效范围使用 `ESP_ERR_INVALID_RESPONSE` |
 | `bus_voltage_divider` | 分压换算倍率，默认约 11；由 `CONFIG_KNOB_BUS_DIVIDER_MILLI / 1000` 决定 |
-| `max_voltage_limit` / `configured_max_voltage_limit` | 按 `config.bus_voltage × (pwm_duty_ceiling − pwm_duty_floor) / √3` 计算的可配置上限；两字段相同，与 configure 校验一致 |
-| `available_voltage_limit` | 按实际使用母线和同一 duty span 计算的电压能力；无效母线时为 0 |
-| `effective_voltage_limit` | `min(config.voltage_limit, available_voltage_limit)`；active 电流环的电压矢量限制，校准仍另限至最多 0.8 V |
+| `max_voltage_limit` / `available_voltage_limit` | 按实际使用母线计算的只读电压能力；默认完整 SVPWM 为 `bus_voltage / √3`，无效母线时为 0 |
+| `configured_max_voltage_limit` | 按名义配置母线计算的参考能力，不是可设置或实际使用的限幅 |
+| `effective_voltage_limit` | 等于 `available_voltage_limit`；active 电流环的电压矢量限制，校准仍另限至最多 0.8 V |
 
-新固件取消此前固定 5 V 的软件电压上限，继续按当前 PWM 占空比边界计算能力。电源下降时可用上限和 PI 抗饱和限制随之下降；电源上升不会突破用户的 `config.voltage_limit`。这些电压字段描述控制与调制能力，不是电机端电压的外部测量。PWM 频率和边界以当前设备报告的 `pwm_hz`、`pwm_profile`、`pwm_duty_floor`、`pwm_duty_ceiling` 为准。
+v8 取消手动电压上限，电源下降或上升时，可用上限与 PI 抗饱和限制均跟随变化。电压字段描述控制与调制能力，不是电机端电压的外部测量。PWM 频率和边界以当前设备报告的 `pwm_hz`、`pwm_profile`、`pwm_duty_floor`、`pwm_duty_ceiling` 为准。
 
 母线任务在 core 0 每 10 ms 读取 ADC2，不在电流 ISR 或电机任务中等待转换。ADC1 电流 DMA 不加入母线通道。开启采样后，初始化/读取错误、ADC 饱和、换算值低于 4.5 V 或高于 30 V 均不可用于驱动；运行时锁存 `bus_voltage_invalid`，样本年龄超过 100 ms 时锁存 `bus_voltage_stale`。尚未获得有效母线的 `enable` / `calibrate` 返回 `bus_voltage_not_ready`。停止后显式 `clear` 在母线仍无效时请求工作任务重新初始化，并清除旧快照；应轮询到新的 `bus_voltage_valid:true` 后再显式使能。读数恢复本身不清故障，也不自动重新启动。
 
@@ -93,17 +177,16 @@ USB 发送改为每次最多 **512 字节**，修复扩展诊断回复超过 409
 ## 完整配置示例
 
 ```json
-{"id":2,"op":"configure","config":{"bus_voltage":19.4,"sense_gain":0.15,"current_limit":0.8,"voltage_limit":2.35,"current_kp":0.4,"current_ki":200,"width":0.1745329252,"strength":20,"endstop":8,"damping":0.003,"snap":0.55,"min_position":0,"max_position":11,"mode":1}}
+{"id":2,"op":"configure","config":{"bus_voltage":19.4,"sense_gain":0.15,"current_limit":0.8,"current_kp":0.4,"current_ki":200,"width":0.1745329252,"strength":20,"endstop":8,"damping":0.003,"snap":0.55,"min_position":0,"max_position":11,"mode":1}}
 ```
 
 所有数值必须有限；NaN/Infinity、缺字段、整数越界均拒绝。
 
 | 字段 | 单位和范围 |
 |---|---|
-| bus_voltage | V，4.5–30；名义配置，决定 configure 可接受的电压上限；ADC2 开启时实际调制使用有效实测值 |
+| bus_voltage | V，4.5–30；名义配置，ADC2 开启时实际调制使用有效实测值 |
 | sense_gain | V/A，只支持 0.15/0.3/0.6/1.2 |
 | current_limit | A，0.02–4.5；默认 0.8，运行目标上限，实测越界先收减扭矩 |
-| voltage_limit | V，0.05–bus_voltage × (pwm_duty_ceiling − pwm_duty_floor)/√3；边界由设备当前 PWM 配置报告 |
 | current_kp / current_ki | V/A，0–20；V/(A·s)，0–1000 |
 | width | rad，1°–180°；页面以度编辑 |
 | strength / endstop | A/rad，0–1000 / 0–20；默认 20 / 8；v6/v7 档位 strength 为中心弹力死区外的斜率，目标受 current_limit 限制；弹簧和端点语义保留 |
@@ -224,18 +307,38 @@ v4 保留兼容字段 `detent_quiet_velocity:false`，实验性的两编码器�
 {"id":10,"op":"diagnose","mode":1,"velocity":55,"current":0.15,"drive_ms":300,"observe_ms":3000}
 {"id":11,"op":"diagnostic_read","offset":0}
 {"id":12,"op":"diagnostic_hold","current":0.15}
+{"id":13,"op":"diagnose","axis":"d","mode":0,"velocity":0,"current":0.3,"drive_ms":500,"observe_ms":500}
 ```
 
-`diagnose` 仅在 idle 且已校准时启动独立 FreeRTOS 任务。参数：mode=0–3，velocity 的绝对值 10–60 rad/s，current=0.02–0.25 A，drive_ms=50–500，observe_ms=500–3000。`current` 只限制驱动阶段的测试目标；释放阶段恢复当前配置的手感及运行电流上限。任务按当前电气参数和指定模式加速、释放，正常电流调节和所有硬件保护保留；速度超过 75 rad/s 中止。测试时间由电机控制任务限定，测试任务在该固定计划内续期租约，所以无需 USB 持续轮询；结束总是停机并恢复原配置，不保存 NVS。上电不自动测试。
+`diagnose` 仅在 idle 且已校准时启动独立 FreeRTOS 任务。省略 `axis` 或指定 `"q"` 时保持原加速/释放行为：mode=0–3，velocity 的绝对值 10–60 rad/s，current=0.02–0.25 A，drive_ms=50–500，observe_ms=500–3000。`current` 只限制驱动阶段的测试目标；释放阶段恢复当前配置的手感及运行电流上限。任务按当前电气参数和指定模式加速、释放，正常电流调节和所有硬件保护保留；速度超过 75 rad/s 中止。测试时间由电机控制任务限定，测试任务在该固定计划内续期租约，所以无需 USB 持续轮询；结束停机并恢复原 RAM 配置，不保存 NVS。上电不自动测试。
+
+`axis:"d"` 选择 v10 固定参考系注流。`mode` 和 `velocity` 可以省略，默认 0；显式给出 velocity 时必须为 0。`current` 范围为 **0.05–3 A**，且不得超过当前 `config.current_limit`；`drive_ms=50–30000`，`observe_ms=100–1000`。请求电流先经过约 200 ms 的平滑爬升，再由正常限流器和 PI 调节；drive_ms 小于 200 时会在爬升完成前结束。`target_d` 报告限流后的实际请求，配置或请求为 3 A 不表示绕组已达到 3 A。
+
+d 轴测试在正式驱动开始时记录转子电角度，并固定该参考系，不随转子继续旋转；同时将该参考系的 q 轴目标设为零。这样产生静止定子磁场，允许空载转子在运动界限内趋于稳定。它不重新校准，也不等同于已经完成真实机械堵转或扭矩标定。机械位移超过起点 0.15 rad、速度绝对值超过 5 rad/s 或运动值非有限时，中止并报告 `diagnostic_motion_guard`。
+
+d 轴驱动期满后立即请求零电压，观察阶段继续保持零输出；总期限到达后失能停机。期限与运动界限由电机任务在 ADC 有效性判断之外检查，采样失败不会延长注流；普通过流、母线和编码器检查仍保留。`diagnostic.reference:"fixed_start_angle"` 表明此时 Id/Iq 和 d/q 电压采用测试开始的固定参考系。正常 q 轴诊断的 reference 为 `"rotor"`。
 
 诊断运行期间只接受主机 `status` 和 `disable`；后者取消计划且阻止排队的测试使能重新运行。普通配置/使能命令被拒绝。完成后 `diagnostic_read` 每次取最多 4 个样本，offset 为已有样本数，从 0 逐页读取。
 
-可选 `diagnostic` 对象含 busy、cancelled、stage、count、peak_speed、peak_current、muted_samples、recovered。stage：0=空闲，1=准备，2=测试驱动，3=释放，4=完成，5=中止，6=普通手拨记录中，7=手拨记录已冻结。recovered 表示释放阶段经历完整静音后力度恢复到 1；不等同于机械已完全静止。驱动阶段的测试电流用于模拟外部甩转，因此不受触觉静音系数影响，仍受电流限制约束。
+可选 `diagnostic` 对象含 busy、cancelled、axis、reference、stage、count、peak_speed、peak_current、muted_samples、recovered。stage：0=空闲，1=准备，2=测试驱动，3=释放，4=完成，5=中止，6=普通手拨记录中，7=手拨记录已冻结。recovered 表示 q 轴释放阶段经历完整静音后力度恢复到 1；不等同于机械已完全静止，也不是 d 轴诊断的电流跟踪验收值。q 轴驱动阶段的测试电流用于模拟外部甩转，因此不受触觉静音系数影响，仍受电流限制约束。
 
 样本为数组：`[elapsed_us, angle, velocity, target, iq, id_current, haptic_scale, voltage_q, phase_peak, flags, velocity_fast, voltage_d, adc_raw_a, adc_raw_b, sample_start_tick, sample_end_tick]`，加速/释放测试间隔约 2 ms，容量 2048。v2 在旧版 12 项数组末尾追加两相原始 ADC 码及采样窗口时刻，便于排查孤立电流尖峰；读取旧固件时应接受缺少末尾四项。flags 的低 8 位为 stage，bit 8 为 haptic_paused，bit 9 为 speed_limited，bits 16–17 / 18–19 为两次实际采样的相号 0/1/2。电流方向与普通遥测相同。取回样本仍使用原协议身份、请求 ID 和 8192 字节主机回复缓冲上限（请求上限仍为 2048 字节）。
+
+v10 d 轴诊断在该数组末尾追加第 17 项 `target_d`，q 轴诊断仍为 16 项。d 轴采集间隔为 `max(200, ceil((drive_us + observe_us) / 2047))` µs，以便 2048 点缓冲覆盖较长测试；有效采样不足时实际记录可能更稀疏。USB 快照均值和这类抽取记录不是完整 5 kHz 电流纹波。
 
 `drive_ms=50` 的短驱动阶段按完整控制频率记录（目标 5 kHz），便于观察固定电流目标下的采样纹波；释放阶段仍约 2 ms。最长释放 3000 ms 时，约 250 个驱动样本加 1500 个释放样本不会占满缓冲。
 
 `diagnostic_hold` 是有载斜坡排查用的短时目标保持，仅在 active、有有效电流、未运行其他诊断且速度低于 2 rad/s 时接受。`current` 使用机械方向，幅值 0.04–0.25 A，不得超过运行电流上限，符号须与当时目标一致。它保持请求目标最多 750 ms，仍经过正常速度包络、限流、PI 和故障保护。超过起点四分之一挡宽（上限 0.05 rad）或速度达到 5 rad/s 会提前停止。期间只接受 status/disable，不能续期；结束自动失能并冻结普通环形记录，flags bit 11 标识保持样本。该命令不保存配置，不在上电时启动；主机应使用保持前稳定目标的均值，避免负载变化混淆比较。750 ms 保持后的 5 kHz 环形记录只覆盖保持稳态，不包含切换起点。
 
 诊断构建的普通 enable 会复用记录缓冲，以完整控制频率滚动记录最近 2048 个样本（约 410 ms）；disable 或故障后冻结，可通过 diagnostic_read 取出，记录中读取会返回 disable_before_trace_read。手拨记录 flags 的 bit 10 表示 quiet_output，bits 16–17 / 18–19 为两次实际采样的相号 0/1/2。`tools/exercise.py --capture` 在停止后自动保存 `.trace.json`，用于排查 USB 低速查询看不到的快速电流变化。正常构建没有此缓冲或自动记录。
+
+`diagnostic_restore_calibration` 仅在诊断构建、idle 且无正在执行的诊断时接受，用于将同一设备烧录前备份的校准恢复到 RAM。请求包含 `encoder` 字符串和完整 `calibration` 对象；编码器名称必须等于当前构建名称，valid 必须为 true，direction 为 ±1，pole_pairs 为 7，electrical_zero 为 `[0, 2π)` 内有限数。身份不符返回 `calibration_identity`，字段不合法返回 `invalid_calibration`，非 idle 返回 `idle_required`。调用只恢复 RAM 校准，不使能、不改配置、不写 NVS。
+
+例如，使用已经读回并保存的完整状态 `backup`：
+
+```python
+device.request("diagnostic_restore_calibration",
+               encoder=backup["encoder"], calibration=backup["calibration"])
+```
+
+该接口不验证备份是否属于当前物理转子或磁铁安装位置；只有在安装与接线未变化时，原备份才仍有相同含义。普通运行配置仍通过停机后的完整 `configure` 恢复；`tools/stall_window_check.py` 本身不生成新校准，退出时核对配置和校准与进入时一致。

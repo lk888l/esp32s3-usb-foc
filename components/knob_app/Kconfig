@@ -13,7 +13,33 @@ config KNOB_CONSOLE_USB
 endchoice
 choice KNOB_PWM_PROFILE
     prompt "PWM and current sampling profile"
-    default KNOB_PWM_10K50
+    default KNOB_PWM_20K65
+config KNOB_PWM_20K90
+    bool "20 kHz / 90 percent (experimental, insufficient sampling windows)"
+    help
+        Uses 0-90 percent phase duty with no minimum pulse floor. The lowest
+        phase is clamped low and the linear voltage circle is 0.9*Vbus/sqrt(3).
+        Current sampling still validates each measured low-side window; this
+        voltage reduction alone does not guarantee a valid window at all angles.
+config KNOB_PWM_20K65
+    bool "20 kHz / 65 percent (ADC acquisition window reserved)"
+    help
+        Derives maximum phase duty from the shared ADC acquisition envelope:
+        6 us settling, START at -2.25 us, ADC1_DONE observation budget at +7 us,
+        1 us rising-edge guard and 0.5 us reserve. At 20 kHz this gives 65%
+        duty and a 17.5 us minimum low-side window. The voltage circle is
+        0.65*Vbus/sqrt(3), with the lowest phase clamped low and no pulse floor.
+        Actual sample checks remain active; exceptional ISR delays are rejected.
+        Conversion completion is observed independently of GDMA callback latency.
+config KNOB_PWM_20K100
+    bool "20 kHz / full-range SVPWM (experimental, reduced sampling windows)"
+    help
+        Uses 0-100 percent phase duty and a Vbus/sqrt(3) linear voltage circle.
+        The current loop follows measured bus voltage automatically. Low-side
+        current samples outside their phase windows are rejected and recovered
+        without latching a sampling-window or control-period fault. High duty
+        can cause repeated feedback recovery and interrupted torque. The
+        default 65 percent profile reserves the ADC acquisition window.
 config KNOB_PWM_10K50
     bool "10 kHz / 50 percent (existing same-window sampling)"
 config KNOB_PWM_5K70
@@ -46,7 +72,7 @@ config KNOB_CONTROL_HZ
         at 2.5 kHz, so a rate comparison does not also change encoder timing.
 config KNOB_BUS_VOLTAGE_SENSE
     bool "Read divided bus voltage on GPIO11 (ADC2_CH0)"
-    default n
+    default y
     help
         Enable only after connecting driver H1-10 (0.1_VCC) to GPIO11 and
         checking the divided voltage against ground. Never connect VM directly.

@@ -28,7 +28,7 @@ public:
     void reset() { overload_ticks_ = peak_ticks_ = 0; }
     // Exposure builds at real elapsed time and recovers four times more slowly.
     // A brief dip cannot hide repeated excess. Invalid samples freeze evidence;
-    // the separate ADC deadline guard handles loss of trustworthy feedback.
+    // the sampling recovery path handles loss of trustworthy feedback.
     KNOB_IRAM bool step(CurrentTripLevel level, unsigned elapsed_us) {
         if (level == CurrentTripLevel::invalid) return false;
         if (level == CurrentTripLevel::emergency) return true;
@@ -53,22 +53,23 @@ private:
     // Quarter-microsecond units retain recovery accuracy at any sample rate.
     unsigned overload_ticks_ = 0, peak_ticks_ = 0;
 };
-constexpr float duty_floor = 0.04f;
+constexpr float duty_floor = pwm_zero_floor ? 0.0f : 0.04f;
 constexpr float duty_ceiling = pwm_profile_duty_ceiling;
 // Zero-clamp falls back to a common minimum pulse near a sector boundary.
 // floor/ceiling <= (3-sqrt(6))/6 guarantees this fallback fits the full circle.
 static_assert(!pwm_zero_clamp || duty_floor <= duty_ceiling * .09f);
-// Linear dq voltage circle allowed by the bus and the sampling duty range.
+// Maximum linear dq voltage circle. Full-range SVPWM gives Vbus / sqrt(3).
 // Invalid bus readings provide no output capacity; callers must also stop on
 // missing/stale measurements rather than substituting a configured voltage.
 KNOB_IRAM float max_output_voltage(float bus_voltage);
-KNOB_IRAM float effective_voltage_limit(float requested_limit, float bus_voltage);
 enum class Mode : int { free, detents, bounded, spring };
 struct Config {
     float bus_voltage = 19.4f;
     float sense_gain = 0.15f; // V/A; minimum supported gain gives conservative current estimates.
     float current_limit = 0.8f;
-    float voltage_limit = 2.35f;
+    // Retain this slot only to read existing NVS blobs without shifting gains
+    // or calibration. It is never validated, exposed, or used by control.
+    float legacy_voltage_limit = 2.35f;
     float current_kp = 0.4f;
     float current_ki = 200;
     float width = pi / 18;

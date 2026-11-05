@@ -11,21 +11,19 @@ static bool valid_duty(float value) {
 }
 static void test_voltage_capacity() {
     Config config;
-    // Retain old low-voltage configurations and accept the full physically
-    // available circle, including voltages beyond the former arbitrary 5 V cap.
+    // Old saved voltage limits occupy a reserved slot but never constrain
+    // output or invalidate an otherwise usable configuration.
     config.bus_voltage = 11.62f;
-    config.voltage_limit = 2.35f;
+    config.legacy_voltage_limit = 2.35f;
     assert(validate(config) == nullptr);
     config.bus_voltage = 19.4f;
-    config.voltage_limit = 5.1f;
+    config.legacy_voltage_limit = std::numeric_limits<float>::quiet_NaN();
     assert(validate(config) == nullptr);
     for (float bus : {4.5f, 5.0f, 11.62f, 19.4f, 24.0f, 30.0f}) {
         config.bus_voltage = bus;
-        config.voltage_limit = max_output_voltage(bus);
         assert(validate(config) == nullptr);
-        const float radius = config.voltage_limit;
-        config.voltage_limit = std::nextafter(radius, std::numeric_limits<float>::infinity());
-        assert(validate(config));
+        const float radius = max_output_voltage(bus);
+        if constexpr (pwm_full_range) assert(near(radius, bus / std::sqrt(3.0f)));
         // Verify line-to-line voltage at the accepted circle boundary through
         // all sectors, rather than testing only that duty has been clipped.
         for (int k = 0; k <= 360; ++k) for (float sign : {-1.0f, 1.0f}) {
@@ -43,23 +41,18 @@ static void test_voltage_capacity() {
     const float infinity = std::numeric_limits<float>::infinity();
     for (float bus : {-1.0f, 0.0f, 4.49f, 30.01f, nan, infinity, -infinity}) {
         assert(max_output_voltage(bus) == 0);
-        assert(effective_voltage_limit(7.0f, bus) == 0);
         config.bus_voltage = bus;
-        config.voltage_limit = 0.1f;
         assert(validate(config));
+        const auto pwm = svpwm({1, 2}, 0, bus);
+        for (float duty : pwm) assert(duty == duty_floor);
     }
-    for (float requested : {-1.0f, 0.0f, nan, infinity, -infinity})
-        assert(effective_voltage_limit(requested, 19.4f) == 0);
-    assert(effective_voltage_limit(2.35f, 19.4f) == 2.35f);
-    assert(effective_voltage_limit(100.0f, 19.4f) == max_output_voltage(19.4f));
 
     // Simulate bus sag/recovery while both PI axes are demanding saturation.
     // The PI must observe the same reduced voltage circle as the modulator,
     // and reconstructing line voltages must not expose extra PWM clipping.
     CurrentLoop loop;
-    const float requested = max_output_voltage(19.4f);
     for (float bus : {19.4f, 11.62f, 4.5f, 24.0f, 19.4f}) {
-        const float limit = effective_voltage_limit(requested, bus);
+        const float limit = max_output_voltage(bus);
         for (int n = 0; n < 100; ++n) {
             const Dq output = loop.step({1.0f, 2.0f}, .0002f, .4f, 200.0f, limit);
             assert(output.d * output.d + output.q * output.q <= limit * limit + 1e-5f);
@@ -72,8 +65,14 @@ static void test_voltage_capacity() {
         }
     }
     const auto stopped = loop.step({1.0f, 2.0f}, .0002f, .4f, 200.0f,
-                                   effective_voltage_limit(requested, nan));
+                                   max_output_voltage(nan));
     assert(stopped.d == 0 && stopped.q == 0);
+
+    // A recovered/rising supply restores full capacity without any nominal
+    // or persisted-voltage clamp; every calculation uses the present sample.
+    assert(max_output_voltage(24.0f) > max_output_voltage(19.4f));
+    assert(near(max_output_voltage(12.0f) * 2, max_output_voltage(24.0f)));
+    if constexpr (pwm_full_range) assert(near(max_output_voltage(12.0f), 6.928203f));
 }
 static void test_zero_clamp_modulation() {
     if constexpr (!pwm_zero_clamp) return;
@@ -121,12 +120,76 @@ static void test_zero_clamp_modulation() {
             previous = pwm;
         }
     }
-    assert(saw_clamped && saw_offset);
-    // At the largest line span, clamping the minimum phase gains the full 4%
-    // window without shortening either nonzero phase's 2 us minimum pulse.
-    const auto pwm = svpwm({7.2f, 0}, pi / 6, bus);
+    assert(saw_clamped && (pwm_zero_floor || saw_offset));
+    // At the largest line span, the zero clamp preserves the requested voltage
+    // right up to the profile's linear circle, including the sampling ceiling.
+    const float voltage = std::min(7.2f, radius);
+    const auto pwm = svpwm({voltage, 0}, pi / 6, bus);
     assert(*std::min_element(pwm.begin(), pwm.end()) == 0);
-    assert(near(*std::max_element(pwm.begin(), pwm.end()), std::sqrt(3.0f) * 7.2f / bus));
+    assert(near(*std::max_element(pwm.begin(), pwm.end()), std::sqrt(3.0f) * voltage / bus));
+}
+static void test_zero_floor_modulation() {
+    if constexpr (!pwm_zero_floor) return;
+    assert(duty_floor == 0 && pwm_zero_clamp);
+    if constexpr (pwm_full_range) {
+        assert(duty_ceiling == 1);
+        assert(near(max_output_voltage(12), 6.928203f));
+    } else if constexpr (duty_ceiling == .65f) {
+        assert(pwm_profile_hz == 20000 && duty_ceiling == .65f);
+        assert(near(max_output_voltage(12), 4.503332f));
+        // The quantized ceiling reserves 700 timer ticks on each side of TEZ.
+        assert(std::lround(2000 * (1 - duty_ceiling)) == 700);
+    } else {
+        assert(pwm_profile_hz == 20000 && duty_ceiling == .90f);
+        assert(near(max_output_voltage(12), 6.235383f));
+        assert(near(max_output_voltage(12), .9f * 12 / std::sqrt(3.0f)));
+        assert(std::lround(2000 * (1 - duty_ceiling)) == 200);
+    }
+    bool reaches_ceiling = false;
+    for (float bus : {4.5f, 12.0f, 19.4f, 30.0f}) {
+        const float radius = max_output_voltage(bus);
+        for (int n = 0; n <= 7200; ++n) {
+            const float angle = n * tau / 7200;
+            const auto pwm = svpwm({radius, 0}, angle, bus);
+            assert(*std::min_element(pwm.begin(), pwm.end()) == 0);
+            reaches_ceiling |= near(*std::max_element(pwm.begin(), pwm.end()), duty_ceiling, 1e-6f);
+            const float common = (pwm[0] + pwm[1] + pwm[2]) / 3;
+            std::array<float, 3> reconstructed{};
+            for (int p = 0; p < 3; ++p) reconstructed[p] = (pwm[p] - common) * bus;
+            const auto dq = park(reconstructed, angle);
+            assert(near(dq.d, radius, 3e-4f));
+            assert(near(dq.q, 0, 3e-4f));
+        }
+    }
+    assert(reaches_ceiling);
+    // Reducing the sampling ceiling must not reactivate the old 4% pulse
+    // floor: tiny nonzero requests stay proportional through every sector.
+    for (float voltage : {1e-5f, 1e-3f, .01f}) {
+        for (int n = 0; n < 720; ++n) {
+            const float angle = n * tau / 720;
+            const auto pwm = svpwm({voltage, 0}, angle, 12);
+            const float peak = *std::max_element(pwm.begin(), pwm.end());
+            assert(*std::min_element(pwm.begin(), pwm.end()) == 0);
+            assert(peak > 0 && peak < .04f);
+            const float alpha = voltage * std::cos(angle);
+            const float beta = voltage * std::sin(angle);
+            assert(near((pwm[0] - pwm[1]) * 12, 1.5f * alpha - .8660254f * beta, 1e-7f));
+            assert(near((pwm[1] - pwm[2]) * 12, 1.7320508f * beta, 1e-7f));
+        }
+    }
+    const float largest = std::numeric_limits<float>::max();
+    const float infinity = std::numeric_limits<float>::infinity();
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    for (float angle : {0.0f, .1f, -tau, 2*tau, largest, -largest}) {
+        for (Dq requested : {Dq{largest, largest}, Dq{largest, -largest}, Dq{-largest, largest}, Dq{-largest, -largest}})
+            for (float duty : svpwm(requested, angle, 12)) assert(std::isfinite(duty) && valid_duty(duty));
+    }
+    for (float invalid : {nan, infinity, -infinity}) {
+        for (Dq requested : {Dq{invalid, 1}, Dq{1, invalid}})
+            for (float duty : svpwm(requested, 0, 12)) assert(duty == 0);
+        for (float duty : svpwm({1, 2}, invalid, 12)) assert(duty == 0);
+    }
+    for (float duty : svpwm({}, 1.2f, 12)) assert(duty == 0);
 }
 static void test_direct_angle_prediction() {
     // Every encoder position is available to haptics on its first update.
@@ -199,10 +262,11 @@ int main() {
     c = {}; c.snap = .49f; assert(validate(c));
     c = {}; c.mode = static_cast<Mode>(5); assert(validate(c));
     c = {}; c.current_kp = std::numeric_limits<float>::quiet_NaN(); assert(validate(c));
-    c = {}; c.bus_voltage = 4.5; c.voltage_limit = max_output_voltage(c.bus_voltage) + .01f; assert(validate(c));
+    c = {}; c.bus_voltage = 4.5; c.legacy_voltage_limit = 999; assert(validate(c) == nullptr);
     c = {}; c.min_position = 12; c.max_position = 11; assert(validate(c));
     test_voltage_capacity();
     test_zero_clamp_modulation();
+    test_zero_floor_modulation();
     Calibration cal{true, -1, 7, 1}; assert(valid_calibration(cal));
     cal.pole_pairs = 12; assert(!valid_calibration(cal));
     // Line voltage must match the inverse Park/Clarke result across every sector,

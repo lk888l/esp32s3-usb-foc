@@ -28,8 +28,6 @@ def capture(args):
             raise RuntimeError("Unexpected PWM frequency; inspect firmware first")
         original = initial["config"].copy()
         config = {**original, "mode": 3}
-        if args.voltage is not None:
-            config["voltage_limit"] = args.voltage
         if args.current is not None:
             config["current_limit"] = args.current
         report["configured"] = device.request("configure", config)
@@ -118,8 +116,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", default="COM7")
     parser.add_argument("--seconds", type=float, default=60)
-    parser.add_argument("--pwm-hz", type=int, default=10000)
-    parser.add_argument("--voltage", type=float)
+    parser.add_argument("--pwm-hz", type=int, default=20000)
     parser.add_argument("--current", type=float)
     parser.add_argument("--wait-for-target", type=float, default=0,
                         help="Arm for up to this many seconds; start timing at |target| > 0.5 A")

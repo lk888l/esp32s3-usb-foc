@@ -2,6 +2,7 @@
 """Native USB framing, reconnect, and rejected-command lease checks."""
 import argparse
 import json
+import math
 import time
 from pathlib import Path
 from knobctl import Knob
@@ -47,6 +48,22 @@ def main():
         initial = device.request("status")
         require(initial["state"] == "idle" and initial["transport"] == "usb_serial_jtag", "Expected idle native USB firmware")
         report["initial"] = initial
+        require(initial.get("voltage_limit_automatic") is True and "voltage_limit" not in initial["config"],
+                "Voltage limit is still configurable")
+        require(initial["bus_voltage_valid"], "Bus voltage is unavailable")
+        require(math.isclose(initial["effective_voltage_limit"], initial["available_voltage_limit"], rel_tol=1e-5),
+                "Automatic voltage capacity differs from the effective limit")
+        if initial["pwm_duty_ceiling"] == 1:
+            require(math.isclose(initial["effective_voltage_limit"], initial["bus_voltage"] / math.sqrt(3), rel_tol=1e-5),
+                    "Full SVPWM capacity does not follow the live bus")
+        refused = device.request("configure", {**initial["config"], "voltage_limit": .8}, allow_error=True)
+        require(not refused["ok"] and refused["error"] == "voltage_limit_automatic",
+                "Retired voltage field was not explicitly rejected")
+        require(refused["config"] == initial["config"] and refused["calibration"] == initial["calibration"] and
+                refused["state"] == "idle" and refused["duty"] == [0, 0, 0],
+                "Rejected voltage field changed settings or energized output")
+        report["voltage_limit_rejection"] = refused
+        passed("automatic_voltage_limit_and_retired_field_rejection")
         device.sequence += 1
         frame = json.dumps({"id": device.sequence, "op": "status"}).encode() + b"\r\n"
         for byte in frame:

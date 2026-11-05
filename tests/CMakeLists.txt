@@ -25,6 +25,11 @@ target_include_directories(diagnostic_hold_tests PRIVATE ../components/knob_app/
 target_compile_options(diagnostic_hold_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 add_test(NAME bounded_diagnostic_hold COMMAND diagnostic_hold_tests)
 
+add_executable(diagnostic_d_current_tests diagnostic_d_current_tests.cpp ../components/knob_core/src/control.cpp)
+target_include_directories(diagnostic_d_current_tests PRIVATE ../components/knob_app/include ../components/knob_core/include)
+target_compile_options(diagnostic_d_current_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME bounded_d_axis_current COMMAND diagnostic_d_current_tests)
+
 add_executable(encoder_mailbox_tests encoder_mailbox_tests.cpp)
 target_include_directories(encoder_mailbox_tests PRIVATE ../components/knob_app/include ../components/knob_encoder/include)
 target_compile_options(encoder_mailbox_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
@@ -46,7 +51,7 @@ target_compile_options(mt6701_dma_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 add_test(NAME mt6701_dma_ownership COMMAND mt6701_dma_tests)
 
 add_executable(pwm_timing_tests pwm_timing_tests.cpp)
-target_include_directories(pwm_timing_tests PRIVATE ../components/knob_hal/include)
+target_include_directories(pwm_timing_tests PRIVATE ../components/knob_hal/include ../components/knob_core/include)
 target_compile_options(pwm_timing_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
 add_test(NAME pwm_latch_prediction COMMAND pwm_timing_tests)
 
@@ -59,9 +64,19 @@ foreach(enabled IN ITEMS 0 1)
     add_test(NAME bus_voltage_${enabled} COMMAND bus_voltage_${enabled}_tests)
 endforeach()
 
+add_executable(sampling_recovery_tests sampling_recovery_tests.cpp)
+target_include_directories(sampling_recovery_tests PRIVATE ../components/knob_app/include ../components/knob_core/include)
+target_compile_options(sampling_recovery_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME sampling_jitter_recovery COMMAND sampling_recovery_tests)
+
+add_executable(control_timing_tests control_timing_tests.cpp ../components/knob_core/src/control.cpp)
+target_include_directories(control_timing_tests PRIVATE ../components/knob_app/include ../components/knob_core/include)
+target_compile_options(control_timing_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME control_feedback_interval COMMAND control_timing_tests)
+
 # Voltage capability and all-sector modulation must agree with each selectable
 # hardware profile, not merely the default host compilation.
-foreach(profile IN ITEMS 5K70 20K70)
+foreach(profile IN ITEMS 10K50 5K70 20K70 20K65 20K90 20K100)
     string(TOLOWER "${profile}" profile_suffix)
     add_executable(control_${profile_suffix}_tests control_tests.cpp ../components/knob_core/src/control.cpp)
     target_include_directories(control_${profile_suffix}_tests PRIVATE ../components/knob_core/include)

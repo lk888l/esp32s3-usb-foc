@@ -51,8 +51,8 @@ def main():
         require(result["state"] == "active", f"Unexpected state: {result['state']}, {result['fault']}")
         require(max(map(abs, result["currents"])) < result.get("current_absolute_trip", result.get("current_trip_limit", 0.9)), "Observed phase current exceeds immediate trip threshold")
         require(abs(result["target"]) <= result["config"]["current_limit"] + 1e-5, "Target exceeds configured current limit")
-        require(max(result["duty"]) <= result.get("pwm_duty_ceiling", 0.4) + 0.00001,
-                "PWM exceeds sampling window")
+        require(min(result["duty"]) >= 0 and max(result["duty"]) <= result["pwm_duty_ceiling"] + 0.00001,
+                "PWM exceeds the reported modulation range")
         return result
 
     try:

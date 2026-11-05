@@ -5,6 +5,8 @@
 #include "protocol.hpp"
 #include "encoder_mailbox.hpp"
 #include "encoder_config.hpp"
+#include "sampling_recovery.hpp"
+#include "control_timing.hpp"
 #include "driver/usb_serial_jtag.h"
 #include "driver/uart.h"
 #include "freertos/queue.h"
@@ -157,12 +159,15 @@ private:
     float sweep_start_ = 0, offset_start_ = 0;
     Dq alignment_current_{};
     SettlingMonitor settling_;
-    unsigned invalid_ = 0;
+    SamplingRecovery sampling_recovery_;
+    ControlSampleClock control_clock_;
+    EncoderFreshness encoder_freshness_;
 #if CONFIG_KNOB_DIAGNOSTICS
     DiagnosticPlan test_plan_{};
     DiagnosticHold torque_hold_{};
     std::array<DiagnosticSample, diagnostic_capacity> test_samples_{};
     int64_t test_started_ = 0, test_sampled_ = 0;
+    float test_origin_ = 0, test_electrical_ = 0;
     int64_t capture_started_ = 0;
     int capture_next_ = 0;
 #endif
@@ -206,7 +211,7 @@ private:
 #endif
         board_.enable(false); board_.write_duty({0, 0, 0});
         state.state = fault ? State::fault : State::idle; state.fault = fault ? fault : "none";
-        state.target = 0; state.duty = {}; state.current_valid = false;
+        state.target = state.target_d = 0; state.duty = {}; state.current_valid = false;
         state.voltage_d = 0; state.voltage_q = 0;
         state.pwm_apply_delay_us = 0;
         quiet_output_.reset(); state.quiet_output = false;
@@ -216,14 +221,51 @@ private:
         current_limiter_.reset(state.config.current_limit); trip_update_at_ = 0;
         current_trip_filter_.reset();
         if (!fault) state.current_trip_limit = overcurrent_threshold(state.config.current_limit);
-        current_loop_.reset(); pulse_start_ = 0;
+        current_loop_.reset(); control_clock_.reset(); pulse_start_ = 0;
+        sampling_recovery_.reset();
+        encoder_freshness_.reset();
     }
     IRAM_ATTR void fail(const char* fault) {
         if (state.state == State::fault) return; // Preserve the first cause until clear.
         if (calibrating_) state.calibration.valid = false;
         halt(fault);
     }
+    IRAM_ATTR void zero_for_feedback_recovery() {
+        // Keep the driver enabled while waiting for trustworthy feedback.
+        // Reset PI once per episode so resumption cannot replay old voltage.
+        if (board_.write_duty({0, 0, 0}) != ESP_OK) { fail("pwm_failure"); return; }
+        current_loop_.reset();
+        control_clock_.reset();
+        state.duty = {}; state.voltage_d = state.voltage_q = 0;
+        state.pwm_apply_delay_us = 0;
+        ++state.sampling_recoveries;
+    }
+#if CONFIG_KNOB_DIAGNOSTICS
+    IRAM_ATTR void update_diagnostic_deadline(int64_t now) {
+        auto& diagnostic = state.diagnostic;
+        if (!diagnostic.busy || diagnostic.axis != DiagnosticAxis::d || !test_started_ ||
+            state.state != State::active || diagnostic.stage < 2 || diagnostic.stage > 3) return;
+        const auto action = diagnostic_d_action(test_plan_, now - test_started_,
+            angle_.angle() - test_origin_, angle_.velocity());
+        if (action == DiagnosticDAction::motion_fault) { fail("diagnostic_motion_guard"); return; }
+        if (action == DiagnosticDAction::complete) {
+            diagnostic.stage = 4; halt(); return;
+        }
+        if (action == DiagnosticDAction::release && diagnostic.stage == 2) {
+            // End injection even if the next current frame is absent/invalid.
+            // Observation remains at zero voltage; this is not an ADC recovery.
+            diagnostic.stage = 3;
+            state.target = state.target_d = 0;
+            current_loop_.reset();
+            control_clock_.reset();
+            if (board_.write_duty({0, 0, 0}) != ESP_OK) { fail("pwm_failure"); return; }
+            state.duty = {}; state.voltage_d = state.voltage_q = 0;
+            state.pwm_apply_delay_us = 0;
+        }
+    }
+#endif
     bool setup_board() {
+        control_clock_.reset();
         if (!bus_.initialize() || board_.initialize() != ESP_OK || !encoder_.initialize() ||
             board_.start_sampling(xTaskGetCurrentTaskHandle()) != ESP_OK) {
             state.hardware_detail = board_.failed_operation();
@@ -253,12 +295,18 @@ private:
         samples_after_ = Board::esp_time();
         last_sample_ = last_encoder_ = metrics_at_ = 0;
         last_sequence_ = metrics_cycles_ = 0;
-        invalid_ = 0;
+        sampling_recovery_.reset();
         angle_.reset(); sample_angle_ = output_angle_ = 0;
         state.angle = state.velocity = state.velocity_fast = 0;
         state.id = state.iq = 0; state.currents = {}; state.volts = {};
         state.adc_sample_valid = false; state.sampling_restart_required = true;
         state.adc_completed_mask = state.adc_window_after_mask = state.adc_slot_mask = 0;
+        state.adc_done_mask = state.adc_done_down_mask = 0;
+        state.adc_done_raw_mask = 0;
+        state.adc_done_ticks = {}; state.adc_done_elapsed_us = {};
+        state.adc_done_words = {};
+        state.adc_armed_words = {};
+        state.adc_current_words = {};
         state.pwm_compare_valid = false;
         state.control_hz = state.control_interval_us = state.control_max_us = 0;
         state.control_cycles = 0;
@@ -289,7 +337,7 @@ private:
             state.bus_voltage_used = state.config.bus_voltage;
             state.bus_voltage_valid = max_output_voltage(state.config.bus_voltage) > 0;
         }
-        state.effective_voltage_limit = effective_voltage_limit(state.config.voltage_limit, state.bus_voltage_used);
+        state.effective_voltage_limit = max_output_voltage(state.bus_voltage_used);
     }
     IRAM_ATTR const char* command(const Request& r, int64_t now) {
 #if CONFIG_KNOB_DIAGNOSTICS
@@ -303,6 +351,13 @@ private:
 #endif
         switch (r.op) {
 #if CONFIG_KNOB_DIAGNOSTICS
+        case Op::diagnostic_restore_calibration:
+            // Restore an explicitly supplied pre-reflash RAM backup. Never
+            // energize the bridge or write NVS as a side effect of restoration.
+            if (state.state != State::idle) return "idle_required";
+            if (!valid_calibration(r.diagnostic_calibration)) return "invalid_calibration";
+            state.calibration = r.diagnostic_calibration;
+            return nullptr;
         case Op::diagnostic_hold:
             if (state.state != State::active || !state.current_valid || state.diagnostic.busy ||
                 r.diagnostic.current * state.target <= 0 ||
@@ -313,15 +368,21 @@ private:
         case Op::diagnose:
             if (state.state != State::idle) return "idle_required";
             if (!valid_calibration(state.calibration)) return "calibrate_first";
+            if (!valid_diagnostic_plan(r.diagnostic, state.config.current_limit)) return "diagnostic_range_or_current_limit";
             if (xQueueSend(test_plans, &r.diagnostic, 0) != pdTRUE) return "diagnostic_busy";
             state.diagnostic = {}; state.diagnostic.busy = true; state.diagnostic.stage = 1;
+            state.diagnostic.axis = r.diagnostic.axis;
             test_started_ = 0; return nullptr;
         case Op::diagnostic_read:
             if (state.diagnostic.stage == 6) return "disable_before_trace_read";
             return r.diagnostic_offset <= state.diagnostic.count ? nullptr : "diagnostic_offset";
         case Op::test_begin:
             if (!r.test_command || !state.diagnostic.busy || state.state != State::active) return "diagnostic_not_ready";
+            if (!valid_diagnostic_plan(r.diagnostic, state.config.current_limit)) return "diagnostic_range_or_current_limit";
             test_plan_ = r.diagnostic; test_started_ = now; test_sampled_ = 0;
+            test_origin_ = angle_.angle(); pulse_start_ = 0;
+            test_electrical_ = wrap(state.calibration.direction * state.calibration.pole_pairs *
+                angle_.wrapped_angle() - state.calibration.electrical_zero);
             state.diagnostic.stage = 2; return nullptr;
         case Op::test_end:
             if (!r.test_command || energized()) return "disable_first";
@@ -338,7 +399,7 @@ private:
                 if (const char* error = restart_sampling()) return error;
             if (!state.bus_voltage_valid) bus_.request_reinitialize();
             if (!ready_) return "hardware_unavailable";
-            board_.reset_trip(); invalid_ = 0; angle_.reset(); last_encoder_ = 0;
+            board_.reset_trip(); sampling_recovery_.reset(); angle_.reset(); last_encoder_ = 0;
             encoder_.acknowledge_errors();
             state.encoder_error = 0; state.fault_magnet = 0;
             state.fault_currents = {}; state.fault_current_valid = false;
@@ -354,7 +415,7 @@ private:
             const auto& c = r.config;
             if (const char* e = validate(c)) return e;
             const bool electrical = c.bus_voltage != state.config.bus_voltage || c.sense_gain != state.config.sense_gain ||
-                c.current_kp != state.config.current_kp || c.current_ki != state.config.current_ki || c.voltage_limit != state.config.voltage_limit;
+                c.current_kp != state.config.current_kp || c.current_ki != state.config.current_ki;
             if (energized() && (electrical || state.state != State::active)) return "disable_before_electrical_config";
             const bool current_changed = c.current_limit != state.config.current_limit;
             // Retain overload/peak exposure across live tuning. Configuration
@@ -377,7 +438,7 @@ private:
                 if (state.state == State::active) board_.set_trip(state.offsets, c.sense_gain, trip);
             }
             state.position = haptic_.position(); state.sub_position = haptic_.sub_position(c, angle_.angle());
-            if (electrical) current_loop_.reset();
+            if (electrical) { current_loop_.reset(); control_clock_.reset(); }
             pulse_start_ = 0; return nullptr;
         }
         case Op::zero:
@@ -388,13 +449,16 @@ private:
             if (state.state != State::active) return "enable_first";
             pulse_start_ = now; return nullptr;
         case Op::calibrate:
-        case Op::enable:
+        case Op::enable: {
             if (!ready_) return "hardware_unavailable";
             if (state.state != State::idle) return "idle_required";
             if (!state.bus_voltage_valid) return "bus_voltage_not_ready";
             if (board_.trip()) return "clear_fault_first";
             if (r.op == Op::enable && !valid_calibration(state.calibration)) return "calibrate_first";
-            if (!board_.sample().valid || now - board_.sample().timestamp_us > 2000) return "adc_window_invalid";
+            const auto startup_sample = board_.sample();
+            if (startup_sample.timestamp_us <= samples_after_ ||
+                !SamplingRecovery::can_start_offsets(!board_.sampling_restart_required(),
+                    startup_sample.timestamp_us, Board::esp_time())) return "adc_window_invalid";
             if (!last_encoder_ || now - last_encoder_ > 2000) return "encoder_not_ready";
             state.control_max_us = 0; state.encoder_age_max_us = 0;
 #if CONFIG_KNOB_DIAGNOSTICS
@@ -403,15 +467,18 @@ private:
             calibrating_ = r.op == Op::calibrate;
             if (calibrating_) state.calibration.valid = false;
             stage_start_ = now; wake_ = false; sums_ = {}; squares_ = {}; counts_ = {};
-            invalid_ = 0; current_loop_.reset(); alignment_current_ = {}; offset_start_ = angle_.angle();
+            sampling_recovery_.reset(now); current_loop_.reset(); alignment_current_ = {}; offset_start_ = angle_.angle();
+            control_clock_.reset();
+            encoder_freshness_.reset();
             current_trip_filter_.reset();
             quiet_output_.reset(); state.quiet_output = false;
             current_limiter_.reset(state.config.current_limit);
             board_.write_duty({0,0,0}); state.state = State::offsets; return nullptr;
         }
+        }
         return "unknown_op";
     }
-    IRAM_ATTR void control(const RawSample& raw, float dt, int64_t now) {
+    IRAM_ATTR void control(const RawSample& raw, float dt, float frame_dt, int64_t now) {
         const auto& c = state.config;
         state.rejected = raw.rejected; state.sample_us = raw.duration_ticks / 80.0f;
         if (state.state == State::offsets) {
@@ -439,7 +506,8 @@ private:
         }
         if (!energized()) return;
 #if CONFIG_KNOB_DIAGNOSTICS
-        if (test_started_ && state.diagnostic.busy && state.diagnostic.stage < 4) {
+        if (test_started_ && state.diagnostic.busy && state.diagnostic.stage < 4 &&
+            state.diagnostic.axis == DiagnosticAxis::q) {
             if (std::abs(angle_.velocity()) > 75) { fail("diagnostic_speed_guard"); return; }
             const int64_t elapsed = now - test_started_;
             if (elapsed >= test_plan_.drive_us + test_plan_.observe_us) {
@@ -452,7 +520,7 @@ private:
         for (int k = 0; k < 2; ++k) {
             const int p = raw.phase[k]; const float v = board_.volts(p, raw.raw[k]);
             if (v < 0.25f || v > 3.05f) {
-                capture_fault_sample(raw, static_cast<int>(dt * 1000000 + .5f), now);
+                capture_fault_sample(raw, static_cast<int>(frame_dt * 1000000 + .5f), now);
                 fail("adc_saturation"); return;
             }
             state.volts[p] = v;
@@ -474,8 +542,10 @@ private:
         const auto current_level = phase_peak >= absolute_current_trip ? CurrentTripLevel::emergency :
                                    phase_peak >= peak_current_trip ? CurrentTripLevel::peak :
                                    phase_peak >= state.current_trip_limit ? CurrentTripLevel::overload : CurrentTripLevel::normal;
-        if (current_trip_filter_.step(current_level, static_cast<unsigned>(dt * 1000000 + .5f))) {
-            capture_fault_sample(raw, static_cast<int>(dt * 1000000 + .5f), now);
+        // A rejected frame is unknown current, not evidence of continued
+        // overload or recovery. Keep protection on observed-frame exposure.
+        if (current_trip_filter_.step(current_level, static_cast<unsigned>(frame_dt * 1000000 + .5f))) {
+            capture_fault_sample(raw, static_cast<int>(frame_dt * 1000000 + .5f), now);
             state.fault_currents = state.currents; state.fault_current_valid = true;
             state.fault_current_trip_limit = state.current_trip_limit;
             state.fault_angle = state.angle;
@@ -486,32 +556,50 @@ private:
         float electrical = wrap(state.calibration.direction * state.calibration.pole_pairs * sample_angle_ - state.calibration.electrical_zero);
         Dq target{};
         bool zero_torque_intent = false;
+        bool d_test = false, d_observing = false;
+#if CONFIG_KNOB_DIAGNOSTICS
+        d_test = state.diagnostic.busy && state.diagnostic.axis == DiagnosticAxis::d;
+        d_observing = d_test && state.diagnostic.stage != 2;
+#endif
         if (state.state == State::active) {
-            state.target = haptic_.step(c, output_angle_, angle_.haptic_velocity());
+            if (d_test) {
 #if CONFIG_KNOB_DIAGNOSTICS
-            if (torque_hold_.active()) state.target = torque_hold_.current();
+                // A stationary stator vector can settle the unloaded rotor;
+                // following the rotor would turn calibration error into a
+                // persistent torque. Diagnostic Id/Iq use this fixed frame.
+                electrical = test_electrical_;
+                target.d = d_observing ? 0 : diagnostic_d_target(test_plan_, now - test_started_);
+                state.target = 0; state.haptic_scale = 0;
+                state.speed_limited = state.haptic_paused = false;
+                zero_torque_intent = d_observing;
 #endif
-            if (pulse_start_) {
-                const int64_t elapsed = now - pulse_start_;
-                if (elapsed < 6000) state.target += elapsed < 3000 ? 0.08f : -0.08f;
-                else pulse_start_ = 0;
-            }
-            zero_torque_intent = state.target == 0;
-            state.target = haptic_speed_.step(state.target, angle_.velocity(), c.current_limit, dt);
-            state.haptic_scale = haptic_speed_.scale();
-            state.speed_limited = haptic_speed_.limited(); state.haptic_paused = haptic_speed_.paused();
+            } else {
+                state.target = haptic_.step(c, output_angle_, angle_.haptic_velocity());
 #if CONFIG_KNOB_DIAGNOSTICS
-            if (state.diagnostic.busy && state.diagnostic.stage == 2) {
-                zero_torque_intent = false;
-                // Bounded external-motion stimulus. Haptics still track angle
-                // and speed, but the test current emulates a hand-driven spin.
-                const float ramp = std::min(1.0f, (now - test_started_) / 50000.0f);
-                state.target = std::clamp(.015f * (test_plan_.velocity * ramp - angle_.velocity()),
-                                          -test_plan_.current, test_plan_.current);
-            }
+                if (torque_hold_.active()) state.target = torque_hold_.current();
 #endif
-            // Haptic torque uses sensor coordinates; electromagnetic torque uses electrical coordinates.
-            target.q = state.target * state.calibration.direction;
+                if (pulse_start_) {
+                    const int64_t elapsed = now - pulse_start_;
+                    if (elapsed < 6000) state.target += elapsed < 3000 ? 0.08f : -0.08f;
+                    else pulse_start_ = 0;
+                }
+                zero_torque_intent = state.target == 0;
+                state.target = haptic_speed_.step(state.target, angle_.velocity(), c.current_limit, dt);
+                state.haptic_scale = haptic_speed_.scale();
+                state.speed_limited = haptic_speed_.limited(); state.haptic_paused = haptic_speed_.paused();
+#if CONFIG_KNOB_DIAGNOSTICS
+                if (state.diagnostic.busy && state.diagnostic.stage == 2) {
+                    zero_torque_intent = false;
+                    // Bounded external-motion stimulus. Haptics still track angle
+                    // and speed, but the test current emulates a hand-driven spin.
+                    const float ramp = std::min(1.0f, (now - test_started_) / 50000.0f);
+                    state.target = std::clamp(.015f * (test_plan_.velocity * ramp - angle_.velocity()),
+                                              -test_plan_.current, test_plan_.current);
+                }
+#endif
+                // Haptic torque uses sensor coordinates; electromagnetic torque uses electrical coordinates.
+                target.q = state.target * state.calibration.direction;
+            }
         } else {
             const float elapsed = (now - stage_start_) * 0.000001f;
             target.d = std::min(0.12f, c.current_limit) * (state.state == State::align ? std::min(1.0f, elapsed / 0.2f) : 1.0f);
@@ -540,11 +628,21 @@ private:
         }
         const Dq measured = park(state.currents, electrical);
         if (state.state == State::active) {
-            target.q = current_limiter_.step(target.q, measured, phase_peak, c.current_limit, dt);
-            state.target = target.q * state.calibration.direction;
+            // Foldback and budget recovery also require observed current;
+            // elapsed blind time must not replenish the operating budget.
+            if (d_test) {
+#if CONFIG_KNOB_DIAGNOSTICS
+                target.d = limit_diagnostic_d_current(current_limiter_, target.d, measured,
+                    phase_peak, c.current_limit, frame_dt);
+#endif
+            } else {
+                target.q = current_limiter_.step(target.q, measured, phase_peak, c.current_limit, frame_dt);
+                state.target = target.q * state.calibration.direction;
+            }
             state.current_target_limit = current_limiter_.capacity();
             state.current_limited = current_limiter_.limited();
         }
+        state.target_d = target.d;
         state.id = measured.d; state.iq = measured.q;
         const float filter = dt / (0.02f + dt);
         alignment_current_.d += filter * (measured.d - alignment_current_.d);
@@ -556,23 +654,28 @@ private:
         // integral then corrects model error/back-EMF instead of remembering a
         // several-millisecond detent pulse after the requested torque is zero.
         constexpr float resistance = CONFIG_KNOB_PHASE_RESISTANCE_MILLIOHM * .001f;
-        state.quiet_output = quiet_output_.step(state.state == State::active && zero_torque_intent,
-                                               angle_.velocity(), dt);
+        state.quiet_output = d_observing || quiet_output_.step(state.state == State::active && zero_torque_intent,
+                                                              angle_.velocity(), dt);
         Dq voltage{};
         if (state.quiet_output) current_loop_.reset();
         else voltage = current_loop_.step({target.d - measured.d, target.q - measured.q}, dt,
             c.current_kp, c.current_ki, limit, {resistance * target.d, resistance * target.q});
-        state.voltage_d = voltage.d; state.voltage_q = voltage.q;
         // Park uses the acquisition angle. The HAL predicts the actual shadow
         // latch from PWM phase and queues the resulting duty in one operation.
-        const float electrical_velocity = state.state == State::active ?
+        const float electrical_velocity = state.state == State::active && !d_test ?
             state.calibration.direction * state.calibration.pole_pairs * angle_.haptic_velocity() : 0;
         if (state.quiet_output) {
             state.duty = {}; state.pwm_apply_delay_us = 0;
-            if (board_.write_duty({0, 0, 0}) != ESP_OK) fail("pwm_failure");
-        } else if (board_.write_voltage(voltage, electrical, electrical_velocity, raw.timestamp_us,
-                                       state.bus_voltage_used, state.duty, state.pwm_apply_delay_us) != ESP_OK)
-            fail("pwm_failure");
+            if (board_.write_duty({0, 0, 0}) != ESP_OK) { fail("pwm_failure"); return; }
+        } else {
+            const esp_err_t written = board_.write_voltage(voltage, electrical, electrical_velocity, raw.timestamp_us,
+                state.bus_voltage_used, state.duty, state.pwm_apply_delay_us);
+            // A busy shadow-commit interval keeps the previous coherent command.
+            // The next fresh control update retries without dropping the bridge.
+            if (written == ESP_ERR_TIMEOUT) { ++state.pwm_deferred; return; }
+            if (written != ESP_OK) { fail("pwm_failure"); return; }
+        }
+        state.voltage_d = voltage.d; state.voltage_q = voltage.q;
 #if CONFIG_KNOB_DIAGNOSTICS
         auto& diagnostic = state.diagnostic;
         if (diagnostic.busy && diagnostic.stage >= 2 && diagnostic.stage <= 3) {
@@ -585,8 +688,9 @@ private:
             // Short drive tests isolate current ripple at the full control
             // rate: <=250 drive samples plus <=1500 release samples fit here.
             // Longer drive/release captures retain the 2 ms cadence.
-            const int capture_period_us = diagnostic.stage == 2 && test_plan_.drive_us <= 50000 ?
-                                          0 : 2000;
+            const int capture_period_us = test_plan_.axis == DiagnosticAxis::d ?
+                diagnostic_capture_period_us(test_plan_) :
+                diagnostic.stage == 2 && test_plan_.drive_us <= 50000 ? 0 : 2000;
             if ((!test_sampled_ || now - test_sampled_ >= capture_period_us) && diagnostic.count < diagnostic_capacity) {
                 test_sampled_ = now;
                 test_samples_[diagnostic.count++] = {
@@ -597,7 +701,7 @@ private:
                                           ((raw.phase[0] | (raw.phase[1] << 2)) << 16)),
                     angle_.haptic_velocity(), state.voltage_d,
                     static_cast<uint16_t>(raw.raw[0]), static_cast<uint16_t>(raw.raw[1]),
-                    static_cast<int16_t>(raw.start_tick), static_cast<int16_t>(raw.end_tick)};
+                    static_cast<int16_t>(raw.start_tick), static_cast<int16_t>(raw.end_tick), state.target_d};
             }
         }
         // Diagnostic builds keep the preceding ~410 ms at the full control
@@ -634,7 +738,7 @@ private:
         if (!ready_) fail("hardware_init_failed");
         while (!should_exit()) {
             if (ready_) ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(5)); else vTaskDelay(pdMS_TO_TICKS(5));
-            const int64_t now = Board::esp_time();
+            int64_t now = Board::esp_time();
             update_bus_voltage(now);
             if (energized() && board_.trip()) {
                 if (board_.trip() == 1) capture_overcurrent();
@@ -642,6 +746,7 @@ private:
             }
 #if CONFIG_KNOB_DIAGNOSTICS
             if (state.state == State::active && torque_hold_.must_stop(now, angle_.angle(), angle_.velocity())) halt();
+            update_diagnostic_deadline(now);
 #endif
             Request request{};
             bool received = xQueueReceive(requests, &request, 0) == pdTRUE;
@@ -672,22 +777,33 @@ private:
                 if (request.op == Op::restart_sampling || request.op == Op::clear) continue;
             }
             if (!ready_) continue;
+            // The ISR watchdog measures task liveness, independently of current
+            // window availability. Invalid ADC observations are handled below.
+            board_.kick();
 #if CONFIG_KNOB_HOST_LEASE_MS > 0
             if (energized() && now - heartbeat_ > CONFIG_KNOB_HOST_LEASE_MS * 1000LL) { fail("host_timeout"); continue; }
 #endif
             const auto raw = board_.sample();
+            now = Board::esp_time();
+            state.pwm_peak_duty = board_.peak_duty();
+            state.pwm_full_duty_cycles = board_.full_duty_cycles();
             state.adc_sample_valid = raw.valid && raw.timestamp_us > samples_after_;
+            state.adc_reject_reasons = raw.rejection_reasons;
+            std::copy_n(raw.rejection_counts, state.adc_reject_counts.size(), state.adc_reject_counts.begin());
             state.sampling_restart_required = board_.sampling_restart_required();
+            if (state.sampling_restart_required && energized()) {
+                fail("adc_transport_failure"); continue;
+            }
             state.adc_dma_words = {raw.dma_words[0], raw.dma_words[1]};
             // A notification can arrive before sample() reads its newer data.
             // The next wake then refers to a sample already consumed here.
-            // Do not run the encoder/control twice or count that wake as a bad
-            // ADC conversion. Real missing samples remain covered by the ISR
-            // watchdog and the 2 ms interval/age checks below.
-            if (raw.timestamp_us <= last_sample_ || raw.timestamp_us <= samples_after_) { ++state.reused_samples; continue; }
-            if (last_sequence_ && raw.sequence > last_sequence_ + 1)
+            // Never integrate the same current measurement twice, but keep
+            // checking encoder health and recovery even if ADC frames stop.
+            const bool new_sample = raw.timestamp_us > last_sample_ && raw.timestamp_us > samples_after_;
+            if (!new_sample) ++state.reused_samples;
+            if (new_sample && last_sequence_ && raw.sequence > last_sequence_ + 1)
                 state.missed_samples += raw.sequence - last_sequence_ - 1;
-            last_sequence_ = raw.sequence;
+            if (new_sample) last_sequence_ = raw.sequence;
             state.current_valid = false;
             state.rejected = raw.rejected; state.sample_us = raw.duration_ticks / 80.0f;
             state.sample_start_tick = raw.start_tick; state.sample_end_tick = raw.end_tick;
@@ -704,6 +820,14 @@ private:
             }
             state.phase_skew_us = raw.phase_skew_us;
             state.adc_completed_mask = raw.adc_completed_mask;
+            state.adc_done_mask = raw.adc_done_mask;
+            state.adc_done_raw_mask = raw.adc_done_raw_mask;
+            state.adc_done_down_mask = raw.adc_done_down_mask;
+            std::copy_n(raw.adc_done_ticks, 3, state.adc_done_ticks.begin());
+            std::copy_n(raw.adc_done_words, 3, state.adc_done_words.begin());
+            std::copy_n(raw.adc_armed_words, 3, state.adc_armed_words.begin());
+            std::copy_n(raw.current_words, 2, state.adc_current_words.begin());
+            std::copy_n(raw.adc_done_elapsed_us, 3, state.adc_done_elapsed_us.begin());
             state.adc_window_after_mask = raw.adc_window_after_mask;
             state.adc_slot_mask = raw.adc_slot_mask;
             state.adc_trigger_down_mask = raw.adc_trigger_down_mask;
@@ -712,8 +836,11 @@ private:
             std::copy_n(raw.pwm_compare_after, 3, state.pwm_compare_after.begin());
             state.pwm_latch_sequence = raw.pwm_latch_sequence;
             state.pwm_compare_valid = raw.pwm_compare_valid;
-            float dt = last_sample_ ? (raw.timestamp_us - last_sample_) * 0.000001f : 1.0f / Board::control_hz;
-            const bool valid_sample = raw.valid && raw.timestamp_us > last_sample_ && now - raw.timestamp_us < 2000 && dt <= 0.002f;
+            const float elapsed_dt = last_sample_ && new_sample ?
+                (raw.timestamp_us - last_sample_) * 0.000001f : 1.0f / Board::control_hz;
+            const float frame_dt = SamplingRecovery::integration_dt(elapsed_dt);
+            const bool valid_sample = new_sample && SamplingRecovery::sample_usable(raw.valid,
+                raw.timestamp_us, last_sample_, now);
             if (raw.timestamp_us > last_sample_) last_sample_ = raw.timestamp_us;
             const auto encoder = encoder_.consume_frame();
             state.encoder_us = encoder.duration_us;
@@ -734,8 +861,21 @@ private:
                 if (!angle_.update(encoder.angle, encoder_dt)) { fail("encoder_jump"); continue; }
                 state.angle = angle_.angle(); state.velocity = angle_.velocity(); state.velocity_fast = angle_.haptic_velocity();
             }
-            if (!last_encoder_ || state.encoder_age_us > 2000) {
+#if CONFIG_KNOB_DIAGNOSTICS
+            update_diagnostic_deadline(now);
+#endif
+            const auto encoder_action = encoder_freshness_.observe(state.encoder_age_us);
+            if (!last_encoder_ || encoder_action == EncoderFreshnessAction::lost) {
                 if (energized()) fail("encoder_stale");
+                continue;
+            }
+            if (encoder_action != EncoderFreshnessAction::ready) {
+                // The prediction horizon is only 2 ms. Pause torque through a
+                // short sensor delay and resume automatically on a fresh frame.
+                ++state.timing_skips;
+                ++state.encoder_timing_skips;
+                if (energized() && encoder_action == EncoderFreshnessAction::zero_voltage)
+                    zero_for_feedback_recovery();
                 continue;
             }
             // Sensor latency belongs to the selected encoder adapter. Predict
@@ -758,18 +898,24 @@ private:
             state.rejected = raw.rejected; state.sample_us = raw.duration_ticks / 80.0f;
             if (!valid_sample) {
                 current_trip_filter_.step(CurrentTripLevel::invalid, 0);
-                if ((invalid_ += static_cast<unsigned>(dt * 1000000 + .5f)) >= 1500 && energized()) {
-                    capture_fault_sample(raw, std::lround(dt * 1000000), now);
-                    fail("adc_window_or_control_deadline");
+                if (new_sample || now - raw.timestamp_us > SamplingRecovery::maximum_sample_age_us) {
+                    ++state.timing_skips;
+                    ++state.adc_timing_skips;
+                }
+                if (energized() && sampling_recovery_.observe(false, now)) {
+                    // Reopen current windows without a latched fault or driver
+                    // disable. PI resumes from zero on the next good sample.
+                    zero_for_feedback_recovery();
                 }
                 continue;
             }
-            invalid_ = 0;
+            sampling_recovery_.observe(true, now);
+            const auto interval = control_clock_.accept(raw.timestamp_us, Board::control_period_us);
             const int64_t control_started = Board::esp_time();
-            board_.kick(); control(raw, dt, now);
+            control(raw, interval.integration_s, frame_dt, now);
             state.control_us = Board::esp_time() - control_started;
             state.control_max_us = std::max(state.control_max_us, state.control_us);
-            state.control_interval_us = dt * 1000000;
+            state.control_interval_us = interval.elapsed_s * 1000000;
             ++state.control_cycles; ++metrics_cycles_;
             if (!metrics_at_) metrics_at_ = now;
             if (now - metrics_at_ >= 500000) {
@@ -913,7 +1059,7 @@ private:
         if (ready && !should_exit()) {
             request.op = Op::test_begin; request.diagnostic = plan;
             ready = transact(request, reply);
-            const int64_t deadline = Board::esp_time() + 4500000;
+            const int64_t deadline = Board::esp_time() + int64_t(plan.drive_us) + plan.observe_us + 2000000;
             while (ready && !should_exit() && Board::esp_time() < deadline) {
                 request.op = Op::status;
                 if (!transact(request, reply) || reply.snapshot.diagnostic.stage >= 4 ||

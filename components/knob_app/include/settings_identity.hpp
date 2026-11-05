@@ -1,11 +1,17 @@
 #pragma once
 #include "control.hpp"
 #include "encoder_types.hpp"
+#include <cstddef>
 #include <cstdint>
 
 namespace knob {
 // Keep the existing blob layout/key so configuration survives sensor changes.
 // Version 1 predates selectable encoders and its calibration is AS5600-only.
+// The former user voltage limit occupies a reserved float. Its bytes remain
+// part of the legacy CRC, but it is neither validated nor used by control.
+static_assert(sizeof(Config) == 56);
+static_assert(offsetof(Config, legacy_voltage_limit) == 12);
+static_assert(offsetof(Config, current_kp) == 16);
 constexpr uint32_t encoder_settings_version(uint32_t encoder_id) {
     return 0x10000U | encoder_id;
 }
