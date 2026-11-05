@@ -220,7 +220,9 @@ float Haptics::step(const Config& c, float angle, float velocity) {
     // Catch up multiple detents without an unbounded loop or integer overflow.
     const float excess = std::abs(error) - c.width * c.snap;
     if (excess > 0 && c.mode != Mode::spring) {
-        int steps = static_cast<int>(std::min(1000.0f, 1 + std::floor(excess / c.width)));
+        // Strictly crossing the threshold advances a detent. At an exact
+        // multi-pitch threshold, floor()+1 would advance one extra detent.
+        int steps = static_cast<int>(std::min(1000.0f, std::ceil(excess / c.width)));
         if (error < 0) steps = -steps;
         int next = std::clamp(position_ + steps, -1000000, 1000000);
         if (c.mode == Mode::bounded) next = std::clamp(next, c.min_position, c.max_position);
@@ -229,24 +231,23 @@ float Haptics::step(const Config& c, float angle, float velocity) {
         error = angle - center_;
     }
     const bool endstop = c.mode == Mode::bounded && ((position_ == c.min_position && error < 0) || (position_ == c.max_position && error > 0));
-    // Quiet detents need very little drag; a full spring stores much more
-    // energy. Do not reuse the low detent damping for an elastic return.
+    // Springs/endstops retain their minimum return damping. Ordinary detents
+    // use the configured D term across the entire pitch, as in SmartKnob.
     const float damping = c.mode == Mode::spring || endstop ? std::max(c.damping, elastic_min_damping) : c.damping;
     float iq = -damping * velocity;
     if (c.mode == Mode::spring) iq -= c.strength * (angle - origin_);
     else if (endstop) iq -= c.endstop * error;
     else if (c.mode != Mode::free) {
-        // A periodic potential barrier, independent of logical snap hysteresis.
-        // The middle 60% of each interval is quiet. Torque opposes the approach
-        // to the boundary and assists the departure, with zero work per pitch.
-        float unit = error / c.width;
-        unit -= std::floor(unit + 0.5f);
-        const float x = std::clamp((std::abs(unit) - .30f) / .20f, 0.0f, 1.0f);
-        const float sine = fast_sin(pi * x);
-        const float peak = std::min(c.current_limit, c.strength * c.width * .5f);
-        const float ramp = std::min(1.0f, 2 * x);
-        const float damping_envelope = ramp * ramp * (3 - 2 * ramp);
-        iq = -std::copysign(peak * sine * sine, unit) - c.damping * velocity * damping_envelope;
+        // SmartKnob's restoring spring uses the SAME center as snap detection.
+        // Crossing snap moves that center by one pitch and flips the spring
+        // toward the next detent in this update. Do not wrap to the nearest
+        // pitch: that would reverse torque before the logical transition.
+        const float dead_zone = std::min(c.width * .2f, pi / 180);
+        const float input = -error + std::clamp(error, -dead_zone, dead_zone);
+        iq += c.strength * input;
+        // Match the reference's geometric idle gate, never a current-amplitude
+        // deadband. Even a tiny restoring request outside the zone survives.
+        if (input == 0 && std::abs(velocity) <= .05f) iq = 0;
     }
     iq = std::clamp(iq, -c.current_limit, c.current_limit);
     // At fast crossings, current/encoder latency can turn a nominally

@@ -15,7 +15,7 @@ constexpr float tau = 2 * pi;
 constexpr float max_motor_current = 4.5f;
 constexpr float peak_current_trip = 5.0f;
 constexpr float absolute_current_trip = 6.0f;
-constexpr float max_haptic_strength = 100.0f;
+constexpr float max_haptic_strength = 1000.0f;
 constexpr unsigned current_overload_trip_us = 20000;
 constexpr unsigned current_peak_trip_us = 1000;
 constexpr unsigned current_trip_recovery_ratio = 4;
@@ -72,9 +72,9 @@ struct Config {
     float current_kp = 0.4f;
     float current_ki = 200;
     float width = pi / 18;
-    float strength = 20.0f; // Peak detent current = strength * width / 2, capped by current_limit.
+    float strength = 20.0f; // A/rad outside the SmartKnob center dead zone; capped by current_limit.
     float endstop = 8.0f; // A/rad
-    float damping = 0.003f; // A/(rad/s); detent damping is local to the barrier.
+    float damping = 0.003f; // A/(rad/s); velocity damping throughout each detent.
     float snap = 0.55f;
     int min_position = 0;
     int max_position = 11;

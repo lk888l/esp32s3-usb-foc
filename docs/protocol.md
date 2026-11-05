@@ -1,10 +1,22 @@
 # SmartKnob USB 协议 v1
 
-## 2026-11-04 当前 PWM 候选、采样恢复与验证范围
+## 2026-11-04 v7 强度上限扩展
 
-当前设备报告 `firmware:"dma-v5-bus-sense"`、`pwm_profile:"20k70_experimental"`，使用 `build/rated-current-20261104/bus.sdkconfig` 构建；源码默认仍为 10 kHz / 50%。新 20 kHz 零相钳位候选已完成构建、烧录、idle 及 0.08 A / 0.8 V 上限下约 5 秒零目标使能检查。该记录目标全为 0，累计拒绝采样增加 97，结束 idle / none，不能作为有载电流或降噪验证。[启动快照](../build/rated-current-20261104/20k-clamped-boot.json)、[零目标检查](../build/rated-current-20261104/20k-clamped-low-current.json)
+当前构建 `firmware:"dma-v7-strength-range"` 将 `strength_max` 从 100 扩展至 **1000 A/rad**，`detent_profile` 继续为 `smart_knob`。`current_limit_max` 仍为 4.5 A，默认强度、电流、电压、PI、速度及过流保护均不因范围扩展而自动改变。上位机须按 `strength_max` 决定允许输入的范围；仅升级上位机时，旧固件仍会拒绝超过其上限的强度。
 
-| 字段 | 当前 20 kHz 候选的含义 |
+v7 已构建、烧录并在停机状态验证 150 / 500 / 1000 接受、1000.01 拒绝，4.51 A 仍拒绝。最终恢复完整原配置与校准，idle / fault:none；未使能高强度输出或写 NVS。[本次验证](../build/strength-1000-20261104/validation.json)
+
+## 2026-11-04 v6 SmartKnob 挡位更新（算法沿用）
+
+v6 构建报告 `firmware:"dma-v6-smart-knob"`、`detent_profile:"smart_knob"`，协议版本仍为 1。挡位恢复为共用中心的迟滞换挡和 P/D 力矩：`snap` 同时决定逻辑换挡及弹力反向位置，`strength` 表示中心弹力死区外的 A/rad，`damping` 作用于整个挡距。完整算法见下方“SmartKnob 挡位力矩与电流响应”。配置字段、NVS 布局、电气参数和速度保护语义保留；`pwm_profile` 继续独立报告构建的 PWM 配置。
+
+v6 已通过 14/14 桌面回归、ESP-IDF 构建并烧录 COM7，运行 ELF SHA256 为 `f76520b34546c85fbf734ad44c76333110e9db8a885cd555cc8a97cd72666cb7`。临时 0.08 A / 0.8 V 下六项 USB／启停检查通过，启用快照为零目标、无故障，累计拒绝采样增加 95；未完成本版手持跨挡或非零电流跟踪验证。最终为 idle / fault:none、`20k70_experimental`，RAM 配置保留原 0.8 A、7.8 V、strength=20、endstop=20、damping=0.03、snap=0.55、10°、Kp=0.4、Ki=200，仅切换 mode=1；校准零点 6.07916546 rad 保持不变。未保存 NVS，重启仍恢复原 mode=3、2.35 V、damping=0.003 等保存值。[验证记录](../build/smart-knob-restore-20261104/validation.json)
+
+## 2026-11-04 v5 PWM 候选、采样恢复与验证范围（历史）
+
+该轮设备报告 `firmware:"dma-v5-bus-sense"`、`pwm_profile:"20k70_experimental"`，使用 `build/rated-current-20261104/bus.sdkconfig` 构建；源码默认仍为 10 kHz / 50%。该 20 kHz 零相钳位候选已完成构建、烧录、idle 及 0.08 A / 0.8 V 上限下约 5 秒零目标使能检查。该记录目标全为 0，累计拒绝采样增加 97，结束 idle / none，不能作为有载电流或降噪验证。[启动快照](../build/rated-current-20261104/20k-clamped-boot.json)、[零目标检查](../build/rated-current-20261104/20k-clamped-low-current.json)
+
+| 字段 | 20 kHz 候选的含义（v6 沿用） |
 |---|---|
 | `pwm_duty_floor` | 0，表示允许最低相钳为零；不能理解为允许任意小的非零脉冲 |
 | `pwm_min_active_duty` | 0.04，所有非零脉冲至少 4%，20 kHz 下为 2 μs |
@@ -25,7 +37,7 @@
 
 `save` 只允许在失能状态执行。NVS 写入尝试结束后，固件自动使用内部操作重建采样；该内部操作不接受 JSON 调用，不确认已有故障，也不重新使能。返回前在 400 ms 共用恢复期限内等待新完整 ADC 快照；写入失败返回 `save_failed`，重建或等待失败返回 `hardware_restart_failed`。后者不表示 NVS 一定未写入，应查询状态核对参数。手动采样失步恢复仍使用显式 `clear`；恢复后继续要求显式 `enable`。[实机保存验证](../build/rated-current-20261104/save-fault-restart.json)同时保留原 `adc_window_or_control_deadline` 故障并返回有效新 ADC 突发，未隐式清故障。
 
-当前 NVS 保存的名义母线/电流上限/电压上限为 **19.4 V / 0.8 A / 2.35 V**，Kp=0.4、Ki=200、mode=3；校准零点为 **6.0791655 rad**、direction=+1、7 极对。7.2 V 保持试验仅修改 RAM，未保存。相电流绝对尺度、温升和声学指标尚未完成外部仪器验证。
+该轮 NVS 保存的名义母线/电流上限/电压上限为 **19.4 V / 0.8 A / 2.35 V**，Kp=0.4、Ki=200、mode=3；校准零点为 **6.0791655 rad**、direction=+1、7 极对。7.2 V 保持试验仅修改 RAM，未保存。相电流绝对尺度、温升和声学指标尚未完成外部仪器验证。
 
 ## 2026-11-04 母线电压与发送更新
 
@@ -94,15 +106,15 @@ USB 发送改为每次最多 **512 字节**，修复扩展诊断回复超过 409
 | voltage_limit | V，0.05–bus_voltage × (pwm_duty_ceiling − pwm_duty_floor)/√3；边界由设备当前 PWM 配置报告 |
 | current_kp / current_ki | V/A，0–20；V/(A·s)，0–1000 |
 | width | rad，1°–180°；页面以度编辑 |
-| strength / endstop | 0–100 / 0–20；默认 20 / 8；档位峰值 `min(current_limit, strength × width / 2)` A；弹簧和端点仍为 A/rad |
-| damping | A·s/rad，0–0.5 |
-| snap | 档距倍数，0.5–1；默认 0.55；逻辑迟滞不移动周期性的力矩曲线 |
+| strength / endstop | A/rad，0–1000 / 0–20；默认 20 / 8；v6/v7 档位 strength 为中心弹力死区外的斜率，目标受 current_limit 限制；弹簧和端点语义保留 |
+| damping | A·s/rad，0–0.5；v6 普通挡位在整个挡距使用速度阻尼，中心静止门限见下文 |
+| snap | 档距倍数，0.5–1；默认 0.55；偏离当前中心严格超过此倍数时换挡，并在同一周期按新中心计算弹力 |
 | min_position / max_position | 有序整数，±10000 |
 | mode | 0=自由，1=档位，2=有限行程，3=弹簧 |
 
 运行期间允许修改手感参数；电气参数需要先停机。只调整强度、阻尼、切换点和电流限制时保留档位中心与电流环积分；模式、档距或行程边界改变时在当前机械位置重建中心，逻辑位置为 clamp(0, min_position, max_position)。被状态机拒绝的请求（例如运行中重复 enable）也不会续期通讯看门狗。显式修改配置母线/增益会清除电角度有效标志，要求重新校准；正常 ADC2 母线更新不修改配置，也不使校准失效。
 
-运行电流上限与异常停机阈值用途不同。目标始终限制在 `±current_limit`，并按实测相电流和 d/q 电流进一步收减。`dma-localized-v4` 保留分级瞬态保护，并使用以下新阈值：
+运行电流上限与异常停机阈值用途不同。目标始终限制在 `±current_limit`，并按实测相电流和 d/q 电流进一步收减。v6 沿用自 v4 起的分级瞬态保护：
 
 | 条件（任一相的实测或重建电流幅值） | 处理 |
 |---|---|
@@ -112,21 +124,26 @@ USB 发送改为每次最多 **512 字节**，修复扩展诊断回复超过 409
 
 两个暴露计时器在越界时按实际采样时间增加，低于各自阈值时以四分之一速度恢复。因此单个短尖峰可以恢复，频繁尖峰不能靠短暂回落反复清零。无效采样冻结暴露，持续采样失效由独立的 1.5 ms 看门狗停机。ISR 和控制任务使用同一判定规则。在线降低上限立即收紧目标，旧普通保护阈值最多保留 20 ms 以等待电流衰减；快速和立即停机阈值不受此过渡影响。
 
-4.5 A 是软件可配置目标上限，默认仍为 0.8 A；开放上限不代表已经实测达到 4.5 A，也不把最大电流当成持续运行额定值。5 A / 6 A 为异常保护阈值。电流换算仍依赖正确的 `sense_gain`；电源输入电流不等于 PWM 驱动下的绕组相电流。感测信号越出 0.25–3.05 V 仍停机，较高感测增益或偏移零点会缩小可测电流范围。电压上限受低侧有效采样窗口约束，当前 10 kHz / 50% 实验在 11.62 V 配置母线下最大约 3.086 V，实际电流还受绕组及反电动势限制。
+4.5 A 是软件可配置目标上限，默认仍为 0.8 A；开放上限不代表已经实测达到 4.5 A，也不把最大电流当成持续运行额定值。5 A / 6 A 为异常保护阈值。电流换算仍依赖正确的 `sense_gain`；电源输入电流不等于 PWM 驱动下的绕组相电流。感测信号越出 0.25–3.05 V 仍停机，较高感测增益或偏移零点会缩小可测电流范围。电压上限受低侧有效采样窗口约束；此前 10 kHz / 50% 实验在 11.62 V 配置母线下最大约 3.086 V，其他 PWM 配置应读取当前设备报告的能力，实际电流还受绕组及反电动势限制。
 
-## 局部档位力矩与电流响应
+## SmartKnob 挡位力矩与电流响应
 
-以下 `dma-localized-v4` / `dma-localized-v4-10k50-voltage-exp3` 名称属于此前构建记录；母线采样新构建报告 `dma-v5-bus-sense`，具体 PWM 配置由 `pwm_profile` 另行标识。
+v6/v7 构建的 `detent_profile:"smart_knob"` 标识当前算法。普通挡位和有限行程内的普通挡位使用以下规则，电流方向仍为编码器机械坐标：
 
-当前采样实验构建报告 `firmware:"dma-localized-v4-10k50-voltage-exp3"`，此前 20 kHz 构建报告 `dma-localized-v4`；协议版本仍为 1，旧客户端可以忽略追加的诊断字段。`detent_profile:"localized_barrier"` 标识既有 v4 触感实现。v4 清理旧编码器的挡位抑振滤波与目标上升斜坡，提高电流、强度配置上限，并恢复低速过档助推。档位中心两侧各 0.3 档距内为零目标电流，含零阻尼；距中心 0.3–0.5 档距形成平滑阻挡，跨过 0.5 档距后平滑助推至下一个空隙。未叠加点击/高速包络时，曲线峰值在 0.4 / 0.6 档距，峰值计算见 strength 字段。`snap` 只影响逻辑 position，避免迟滞切档时力矩突跳。10° 档距下，要请求 4.5 A 静态峰值，需同时将 current_limit 设为 4.5、strength 设为至少约 51.57；仅提高一个上限不会绕过另一个限制。
+1. 以 `error = angle − center` 判定换挡。仅在 `abs(error) > width × snap` 时移动中心及逻辑 position，随后重新计算 error；有限行程夹紧在 min/max。跨多挡使用 `ceil((abs(error) − width × snap) / width)` 计算次数，修正旧 `floor(...) + 1` 在精确多挡阈值处多进一挡的问题。
+2. 中心弹力死区 `dead_zone = min(width × 0.2, π/180)`。弹力输入 `input = −error + clamp(error, −dead_zone, dead_zone)`，原始目标为 `strength × input − damping × velocity_fast`。这里的 center 与换挡判定相同，不再按半挡距重新取模。因此跨过 snap 后，弹力在该周期转向新的中心；未跨挡时，死区边缘的弹力连续起升。
+3. 只有 `input == 0` 且 `abs(velocity_fast) <= 0.05 rad/s` 时将普通挡位目标归零，避免中心静止时速度量化引入小阻尼目标。中心外即使弹力很小也不会被幅值门限切掉；中心内正常转动仍有阻尼。
+4. 合成目标先限制在 `±current_limit`，再保留同向助推衰减、共同高速包络及实测电流限幅。静态正向切换前的弹力幅值上界为 `min(current_limit, strength × max(width × snap − dead_zone, 0))`；动态目标还包括阻尼，实际电流受电压能力约束。`strength × width / 2` 是旧周期曲线的峰值公式，不适用于 v6。
+
+历史 `dma-localized-v4`、`dma-localized-v4-10k50-voltage-exp3` 和 `dma-v5-bus-sense` 的 `detent_profile` 为 `localized_barrier`：中心两侧各 0.3 挡距内为零弹力、零阻尼，峰值固定在 0.4 / 0.6 挡距，0.5 挡距的弹力为零，snap 只改变逻辑 position。这解释了逻辑换挡与波形峰值错位；该曲线已由 v6 的共用中心 P/D 替代。协议版本及已有配置字段保持兼容，但相同 strength/damping 数值的手感会变化。
 
 `quiet_output` 表示电气静音：原始力矩意图严格为零且速度低于 0.25 rad/s 连续 20 ms 后，清空 d/q PI 并输出零电压。任何非零力矩意图立即恢复连续电流控制；速度超过 0.7 rad/s 也立即恢复，以便抵消反电动势、避免转动空隙产生短路制动。进入/退出速度迟滞避免静止编码器噪声反复开关。这不是按电流幅值硬切断，微小非零跨档力矩仍保持连续。
 
-v4 删除了 0.15 ms 双级位置平滑、一码偏差限制和两编码器区间挡位速度分支。力矩曲线直接使用连续角度加快速速度预测；按时间戳与传感器延迟补偿的预测保留，0.5 ms 速度滤波继续服务于预测和阻尼。电流 Park 变换仍使用电流采样时刻的预测电角度。
+v6 继续沿用 v4 已清理的输入路径：不使用 0.15 ms 双级位置平滑、一码偏差限制或两编码器区间挡位速度分支。换挡判定和力矩计算直接使用同一个连续角度加快速速度预测；按时间戳与传感器延迟补偿的预测保留，0.5 ms 速度滤波继续服务于预测和阻尼。电流 Park 变换仍使用电流采样时刻的预测电角度。
 
 电流目标增加、撤力和反向直接生效，已删除 1000 A/s 的额外目标上升斜坡；目标仍受实测超限降额及 d 轴电流余量限制，实际绕组电流由 PI 与电压能力决定。电阻前馈在电压圆约束内与 PI 相加。`current_feedforward_ohms` 报告 Kconfig 中的近似绕组电阻，当前默认 0（关闭）；不是在线测量值，不属于 NVS Config。此前 4.5 Ω 是旧 2804 的估计值，换用 22008 后未复用。
 
-弹簧与行程端点的回程阻尼取 `max(damping, 0.04)` A·s/rad，防止将低阻尼档位参数用于持续弹性回中而产生余振；档位空隙不受此值影响。 遥测 `elastic_min_damping` 报告该值。
+弹簧与行程端点的回程阻尼取 `max(damping, 0.04)` A·s/rad，防止将低阻尼档位参数用于持续弹性回中而产生余振；普通挡位仅使用配置 damping，不使用该最小值。遥测 `elastic_min_damping` 报告该值。自由模式、弹簧和端点的力矩规则未随普通挡位恢复而改变。
 
 ## 高速触觉衰减
 
@@ -134,7 +151,7 @@ v4 删除了 0.15 ms 双级位置平滑、一码偏差限制和两编码器区�
 
 力度在所有效果（含阻尼、弹簧、端点和点击）合并并限流后统一缩放，再经过实测电流限幅和 d/q 电流 PI；暂停期间仍闭环调节零目标电流。虚拟档位持续跟踪角度，恢复不会追回积压档位。模式切换、在线调参及 `zero` 不重置高速暂停状态；弹簧原点和有限行程边界保持各自语义。阈值固定在固件中，不更改 `Config` 或 NVS 格式。
 
-局部档位的同向助推在绝对速度 0–10 rad/s 保持全量，10–25 rad/s 随速度线性减弱，25 rad/s 时归零；跨档前的反向阻挡保留，再经过共同的高速包络。弹簧/行程端点继续使用 10–25 rad/s 的回程助推衰减。低速过档恢复完整助推，高速连续跨档和弹性回程仍限制持续补能。空隙内依然为零目标，不增加全域阻尼。可选遥测 `detent_assist_fade_start` / `detent_assist_cutoff` 分别报告 10 / 25 rad/s。
+普通挡位的同向助推在绝对速度 0–10 rad/s 保持全量，10–25 rad/s 随速度线性减弱，25 rad/s 时归零；跨档前的反向阻挡保留，再经过共同的高速包络。弹簧/行程端点继续使用 10–25 rad/s 的回程助推衰减。低速过档保留完整助推，高速连续跨档和弹性回程仍限制持续补能。v6 的速度阻尼作用于整个挡距，中心静止门限按上述 SmartKnob 规则处理。可选遥测 `detent_assist_fade_start` / `detent_assist_cutoff` 分别报告 10 / 25 rad/s。
 
 这是目标扭矩的渐变，不代表实际绕组电流瞬间归零。异常过流、磁铁丢失、编码器跳变/传输失败/CRC 失败、采样失效及启用租约时的主机超时仍锁存停机。校准及零点采样阶段没有触觉输出包络，过快运动仍中止，原因是 `calibration_motion_too_fast`。
 
@@ -189,7 +206,7 @@ v4 保留兼容字段 `detent_quiet_velocity:false`，实验性的两编码器�
 - `voltage_d` / `voltage_q`：实际发往 SVPWM 的电压分量 V，用于观察电流 PI 是否已到电压上限。
 - `encoder_us` / `control_us`：最近一次编码器读取及控制计算耗时 μs。`fault_sample` 在采样/控制时限故障或过流后出现，保留触发样本的 `valid`、`interval_us`、`age_us`、`start_tick`、`end_tick`、`duration_us`，直到 `clear`，便于区分窗口错误和过期采样。可选 `adc_dma_words`、`adc_raw`、`adc_phase` 分别锁存同一故障样本的两字原始 DMA 数据、12 位 ADC 码、相号（0/1/2）；它们不是停机后继续刷新的顶层 `adc_dma_words`。`valid:false` 时原始字段仅用于排查，可能不完整，不代表可用电流。旧固件可以没有这些字段；`clear` 同时清空故障原始数据。
 - `current_limit_max`：固件接受的运行上限，当前为 4.5 A；旧协议 v1 固件无此字段时，上位机按 0.8 A 处理。
-- `strength_max`：固件接受的强度上限，当前为 100；旧固件没有此字段时，上位机应保留旧版 10 的限制。此字段不改变 `config` 或 NVS 格式。
+- `strength_max`：固件接受的强度上限，v7 为 1000，v4–v6 为 100；旧固件没有此字段时，上位机应保留旧版 10 的限制。此字段不改变 `config` 或 NVS 格式。
 - `current_trip_limit` / `current_absolute_trip`：当前持续过流阈值 / 单样本立即停机阈值 A；前者会在降低运行上限的 20 ms 过渡期内保留旧值。
 - `current_peak_trip` / `current_peak_trip_ms`：快速保护阈值 5 A / 暴露预算 1 ms。`current_overload_trip_ms` 为普通超限暴露预算 20 ms，`current_trip_recovery_ratio` 为恢复时间倍率 4。`current_absolute_trip` 当前为 6 A。上位机应读取固件报告值，不沿用旧版 1.25 A / 1.75 A 常量。
 - `current_target_limit` / `current_limited`：收减后可用的 q 轴目标幅度 A / 是否正在限流；停机时幅度为 0。

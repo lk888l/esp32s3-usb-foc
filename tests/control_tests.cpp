@@ -191,6 +191,9 @@ int main() {
     c.current_limit = max_motor_current + .01f; assert(validate(c));
     c = {}; c.strength = max_haptic_strength; assert(validate(c) == nullptr);
     c.strength = max_haptic_strength + .01f; assert(validate(c));
+    c.strength = std::nextafter(max_haptic_strength, std::numeric_limits<float>::infinity()); assert(validate(c));
+    c = {}; c.strength = 1000; assert(validate(c) == nullptr);
+    assert(max_motor_current == 4.5f); // Strength range never expands the motor current limit.
     c = {}; c.sense_gain = .2f; assert(validate(c));
     c = {}; c.width = 0; assert(validate(c));
     c = {}; c.snap = .49f; assert(validate(c));
@@ -288,7 +291,7 @@ int main() {
     Config next = c; next.strength = .7f; next.current_limit = .3f;
     h.reconfigure(c, next, .42f);
     assert(h.position() == 4); assert(near(h.sub_position(next, .42f), sub));
-    assert(near(h.step(next, .42f, 0), 0)); // Quiet interval preserves geometry.
+    assert(near(h.step(next, .42f, 0), -next.strength * (.02f - pi / 180)));
     // Mode and spacing changes establish a center at the current angle.
     c = next; next.mode = Mode::bounded; next.min_position = 3; next.max_position = 5;
     h.reconfigure(c, next, 1.2f);
