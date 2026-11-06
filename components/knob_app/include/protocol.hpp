@@ -1,6 +1,8 @@
 #pragma once
 #include "control.hpp"
 #include "bus_voltage.hpp"
+#include "calibration_sequence.hpp"
+#include "calibration_quality.hpp"
 #include "cJSON.h"
 #include <array>
 #include "sdkconfig.h"
@@ -18,6 +20,7 @@ enum class State { idle, offsets, align, sweep, settle, active, fault };
 const char* state_name(State state);
 struct Request {
     int id = 0; Op op = Op::status; Config config{}; bool renew_lease = true;
+    CalibrationPlan calibration_plan{};
 #if CONFIG_KNOB_DIAGNOSTICS
     DiagnosticPlan diagnostic{};
     Calibration diagnostic_calibration{};
@@ -25,9 +28,25 @@ struct Request {
     bool test_command = false;
 #endif
 };
+// The most recent attempt is separate from the last accepted calibration.
+// Failed/cancelled attempts cannot overwrite the accepted result or its quality.
+struct CalibrationReport {
+    const char* stage = "not_run";
+    const char* error = "none";
+    bool passed = false, cancelled = false;
+    unsigned attempts = 0, point = 0;
+    float elapsed_s = 0;
+    float zero_forward = 0, zero_reverse = 0;
+    float observed_d = 0, observed_q = 0, tracking_error = 0, saturation_fraction = 0;
+    CalibrationQuality quality{};
+    std::array<std::array<float, 3>, 3> phase_response{};
+};
 struct Snapshot {
     Config config{};
     Calibration calibration{};
+    CalibrationQuality calibration_quality{};
+    CalibrationReport calibration_report{};
+    std::array<float, 3> offset_noise_a{}, offset_sem_a{}, offset_drift_a{};
     State state = State::idle;
     const char* fault = "none";
     const char* hardware_detail = "none";
@@ -49,6 +68,7 @@ struct Snapshot {
     bool bus_voltage_valid = false;
     uint32_t rejected = 0, reused_samples = 0;
     uint32_t missed_samples = 0, control_cycles = 0;
+    uint32_t control_stack_free = 0;
     uint32_t timing_skips = 0, sampling_recoveries = 0, pwm_deferred = 0;
     uint32_t adc_timing_skips = 0, encoder_timing_skips = 0;
     float pwm_peak_duty = 0;
@@ -111,6 +131,6 @@ struct Reply {
 };
 const char* decode_request(const char* line, Request& request);
 cJSON* encode_reply(int id, const Reply& reply);
-bool load_settings(Config& config, Calibration& calibration);
-bool save_settings(const Config& config, const Calibration& calibration);
+bool load_settings(Config& config, Calibration& calibration, CalibrationQuality& quality);
+bool save_settings(const Config& config, const Calibration& calibration, const CalibrationQuality& quality);
 }

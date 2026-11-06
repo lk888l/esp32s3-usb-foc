@@ -7,6 +7,7 @@
 #include "encoder_config.hpp"
 #include "sampling_recovery.hpp"
 #include "control_timing.hpp"
+#include "current_offsets.hpp"
 #include "driver/usb_serial_jtag.h"
 #include "driver/uart.h"
 #include "freertos/queue.h"
@@ -154,11 +155,11 @@ private:
     int64_t trip_update_at_ = 0, last_encoder_ = 0, metrics_at_ = 0, samples_after_ = 0;
     uint32_t last_sequence_ = 0, metrics_cycles_ = 0;
     float sample_angle_ = 0, output_angle_ = 0;
-    std::array<float, 3> sums_{}, squares_{};
-    std::array<int, 3> counts_{};
-    float sweep_start_ = 0, offset_start_ = 0;
-    Dq alignment_current_{};
-    SettlingMonitor settling_;
+    CurrentOffsetCollector offsets_;
+    CalibrationSequence calibration_sequence_;
+    CalibrationPlan calibration_plan_{};
+    int64_t calibration_started_ = 0;
+    float offset_start_ = 0;
     SamplingRecovery sampling_recovery_;
     ControlSampleClock control_clock_;
     EncoderFreshness encoder_freshness_;
@@ -202,6 +203,14 @@ private:
         state.fault_velocity_fast = state.velocity_fast;
     }
     IRAM_ATTR void halt(const char* fault = nullptr) {
+        if (calibrating_) {
+            calibration_sequence_.abort();
+            state.calibration_report.passed = false;
+            state.calibration_report.cancelled = fault == nullptr;
+            state.calibration_report.stage = fault ? "failed" : "cancelled";
+            state.calibration_report.error = fault ? fault : "calibration_cancelled";
+            calibrating_ = false;
+        }
 #if CONFIG_KNOB_DIAGNOSTICS
         torque_hold_.reset();
         if (state.diagnostic.busy && state.diagnostic.stage < 4) {
@@ -227,10 +236,11 @@ private:
     }
     IRAM_ATTR void fail(const char* fault) {
         if (state.state == State::fault) return; // Preserve the first cause until clear.
-        if (calibrating_) state.calibration.valid = false;
         halt(fault);
     }
     IRAM_ATTR void zero_for_feedback_recovery() {
+        if (calibrating_ && state.state != State::offsets)
+            calibration_sequence_.invalidate(Board::esp_time(), true);
         // Keep the driver enabled while waiting for trustworthy feedback.
         // Reset PI once per episode so resumption cannot replay old voltage.
         if (board_.write_duty({0, 0, 0}) != ESP_OK) { fail("pwm_failure"); return; }
@@ -357,6 +367,7 @@ private:
             if (state.state != State::idle) return "idle_required";
             if (!valid_calibration(r.diagnostic_calibration)) return "invalid_calibration";
             state.calibration = r.diagnostic_calibration;
+            state.calibration_quality = {};
             return nullptr;
         case Op::diagnostic_hold:
             if (state.state != State::active || !state.current_valid || state.diagnostic.busy ||
@@ -420,7 +431,9 @@ private:
             const bool current_changed = c.current_limit != state.config.current_limit;
             // Retain overload/peak exposure across live tuning. Configuration
             // changes cannot stand in for valid below-threshold recovery.
-            if (c.sense_gain != state.config.sense_gain || c.bus_voltage != state.config.bus_voltage) state.calibration.valid = false;
+            if (c.sense_gain != state.config.sense_gain || c.bus_voltage != state.config.bus_voltage) {
+                state.calibration.valid = false; state.calibration_quality = {};
+            }
             haptic_.reconfigure(state.config, c, angle_.angle());
             state.config = c;
             update_bus_voltage(now);
@@ -455,6 +468,10 @@ private:
             if (!state.bus_voltage_valid) return "bus_voltage_not_ready";
             if (board_.trip()) return "clear_fault_first";
             if (r.op == Op::enable && !valid_calibration(state.calibration)) return "calibrate_first";
+            if (r.op == Op::calibrate)
+                if (const char* error = validate_calibration_plan(r.calibration_plan)) return error;
+            if (r.op == Op::calibrate && r.calibration_plan.max_current > state.config.current_limit)
+                return "calibration_exceeds_current_limit";
             const auto startup_sample = board_.sample();
             if (startup_sample.timestamp_us <= samples_after_ ||
                 !SamplingRecovery::can_start_offsets(!board_.sampling_restart_required(),
@@ -465,9 +482,16 @@ private:
             if (!state.diagnostic.busy) { state.diagnostic = {}; capture_next_ = 0; }
 #endif
             calibrating_ = r.op == Op::calibrate;
-            if (calibrating_) state.calibration.valid = false;
-            stage_start_ = now; wake_ = false; sums_ = {}; squares_ = {}; counts_ = {};
-            sampling_recovery_.reset(now); current_loop_.reset(); alignment_current_ = {}; offset_start_ = angle_.angle();
+            if (calibrating_) {
+                calibration_plan_ = r.calibration_plan;
+                calibration_started_ = now;
+                state.calibration_report = {};
+                state.calibration_report.stage = "offsets";
+                state.calibration_report.quality.current = calibration_plan_.current;
+                state.calibration_report.quality.voltage_limit = calibration_plan_.voltage_limit;
+            }
+            stage_start_ = now; wake_ = false; offsets_.reset(state.config.sense_gain);
+            sampling_recovery_.reset(now); current_loop_.reset(); offset_start_ = angle_.angle();
             control_clock_.reset();
             encoder_freshness_.reset();
             current_trip_filter_.reset();
@@ -488,19 +512,26 @@ private:
             if (std::abs(angle_.angle() - offset_start_) > 0.03f) { fail("keep_rotor_still_for_offsets"); return; }
             for (int k = 0; k < 2; ++k) {
                 const int p = raw.phase[k]; const float v = board_.volts(p, raw.raw[k]);
-                sums_[p] += v; squares_[p] += v * v; ++counts_[p]; state.volts[p] = v;
+                offsets_.add(p, v); state.volts[p] = v;
             }
-            if (*std::min_element(counts_.begin(), counts_.end()) < 128) return;
-            for (int p = 0; p < 3; ++p) {
-                const float zero = sums_[p] / counts_[p];
-                if (zero < 0.7f || zero > 2.2f || squares_[p] / counts_[p] - zero * zero > 0.000625f) {
-                    fail("invalid_current_offsets_check_mode_gain"); return;
-                }
-                state.offsets[p] = zero;
+            state.offset_noise_a = offsets_.noise_a();
+            state.offset_sem_a = offsets_.standard_error_a();
+            state.offset_drift_a = offsets_.drift_a();
+            if (calibrating_) {
+                state.calibration_report.quality.noise_a = state.offset_noise_a;
+                state.calibration_report.quality.sem_a = state.offset_sem_a;
+                state.calibration_report.quality.drift_a = state.offset_drift_a;
             }
-            state.current_trip_limit = overcurrent_threshold(c.current_limit);
+            if (offsets_.error()) { fail(offsets_.error()); return; }
+            if (!offsets_.complete()) return;
+            state.offsets = offsets_.means();
+            state.current_trip_limit = overcurrent_threshold(calibrating_ ? calibration_plan_.max_current : c.current_limit);
             board_.set_trip(state.offsets, c.sense_gain, state.current_trip_limit);
-            if (calibrating_) { state.state = State::align; stage_start_ = now; settling_.reset(); }
+            if (calibrating_) {
+                if (!calibration_sequence_.start(calibration_plan_, now)) { fail("calibration_parameters"); return; }
+                state.state = State::align; stage_start_ = now;
+                update_calibration_report(now);
+            }
             else { state.state = State::active; haptic_.reset(angle_.angle(), std::clamp(0,c.min_position,c.max_position)); }
             return;
         }
@@ -557,6 +588,8 @@ private:
         Dq target{};
         bool zero_torque_intent = false;
         bool d_test = false, d_observing = false;
+        bool calibration_voltage_mode = false;
+        float calibration_voltage = 0;
 #if CONFIG_KNOB_DIAGNOSTICS
         d_test = state.diagnostic.busy && state.diagnostic.axis == DiagnosticAxis::d;
         d_observing = d_test && state.diagnostic.stage != 2;
@@ -601,30 +634,31 @@ private:
                 target.q = state.target * state.calibration.direction;
             }
         } else {
-            const float elapsed = (now - stage_start_) * 0.000001f;
-            target.d = std::min(0.12f, c.current_limit) * (state.state == State::align ? std::min(1.0f, elapsed / 0.2f) : 1.0f);
-            electrical = 0;
-            settling_.update(angle_.angle(), dt);
-            if (state.state == State::align && elapsed > 0.8f) {
-                if (!alignment_tracking(target.d)) { fail("calibration_current_tracking"); return; }
-                if (settling_.still()) { state.state = State::sweep; stage_start_ = now; sweep_start_ = angle_.angle(); }
-                else if (elapsed > 2) { fail("alignment_unstable"); return; }
-            } else if (state.state == State::sweep) {
-                electrical = tau * std::min(1.0f, elapsed / 3.0f);
-                if (elapsed >= 3) { state.state = State::settle; stage_start_ = now; settling_.reset(); }
-            } else if (state.state == State::settle && elapsed > 0.5f) {
-                if (!alignment_tracking(target.d)) { fail("calibration_current_tracking"); return; }
-                const float delta = angle_.angle() - sweep_start_;
-                if (std::abs(std::abs(delta) - tau / 7) > 0.18f) {
-                    fail("calibration_motion_mismatch_7pp"); return;
+            CalibrationSequenceInput input{};
+            input.now_us = now; input.rotor_angle = angle_.angle();
+            input.currents = state.currents;
+            input.measured_phases = {raw.phase[0], raw.phase[1]};
+            input.output_voltage = std::sqrt(state.voltage_d * state.voltage_d + state.voltage_q * state.voltage_q);
+            input.available_voltage_limit = state.effective_voltage_limit;
+            const auto command = calibration_sequence_.tick(input);
+            update_calibration_report(now);
+            if (command.error) { fail(command.error); return; }
+            if (command.done) {
+                const auto candidate = calibration_sequence_.candidate();
+                if (!valid_calibration(candidate) || !valid_calibration_quality(state.calibration_report.quality)) {
+                    fail("calibration_quality_invalid"); return;
                 }
-                if (settling_.still()) {
-                    state.calibration.direction = delta > 0 ? 1 : -1;
-                    state.calibration.electrical_zero = wrap(state.calibration.direction * 7 * wrap(angle_.angle()));
-                    state.calibration.valid = true; calibrating_ = false; halt(); return;
-                }
-                if (elapsed > 1.5f) { fail("alignment_unstable"); return; }
+                state.calibration = candidate;
+                state.calibration_quality = state.calibration_report.quality;
+                calibrating_ = false; halt(); return;
             }
+            const auto stage = calibration_sequence_.report().stage;
+            state.state = stage == CalibrationStage::forward || stage == CalibrationStage::reverse ? State::sweep :
+                stage == CalibrationStage::verify || stage == CalibrationStage::evaluate ? State::settle : State::align;
+            electrical = wrap(command.angle); target.d = command.current;
+            calibration_voltage_mode = command.voltage_mode;
+            calibration_voltage = command.voltage_d;
+            if (command.reset_controller) current_loop_.reset();
         }
         const Dq measured = park(state.currents, electrical);
         if (state.state == State::active) {
@@ -644,12 +678,9 @@ private:
         }
         state.target_d = target.d;
         state.id = measured.d; state.iq = measured.q;
-        const float filter = dt / (0.02f + dt);
-        alignment_current_.d += filter * (measured.d - alignment_current_.d);
-        alignment_current_.q += filter * (measured.q - alignment_current_.q);
         state.current_valid = true;
         const float limit = state.state == State::active ? state.effective_voltage_limit :
-            std::min(state.effective_voltage_limit, 0.8f);
+            std::min(state.effective_voltage_limit, calibration_plan_.voltage_limit);
         // Supply winding voltage on the same tick as the torque request. The
         // integral then corrects model error/back-EMF instead of remembering a
         // several-millisecond detent pulse after the requested torque is zero.
@@ -658,6 +689,9 @@ private:
                                                               angle_.velocity(), dt);
         Dq voltage{};
         if (state.quiet_output) current_loop_.reset();
+        else if (calibration_voltage_mode) {
+            current_loop_.reset(); voltage.d = std::clamp(calibration_voltage, -limit, limit);
+        }
         else voltage = current_loop_.step({target.d - measured.d, target.q - measured.q}, dt,
             c.current_kp, c.current_ki, limit, {resistance * target.d, resistance * target.q});
         // Park uses the acquisition angle. The HAL predicts the actual shadow
@@ -727,9 +761,30 @@ private:
         }
 #endif
     }
-    bool alignment_tracking(float target) const {
-        const float tolerance = std::max(0.015f, target * 0.35f);
-        return std::abs(alignment_current_.d - target) < tolerance && std::abs(alignment_current_.q) < tolerance;
+    void update_calibration_report(int64_t now) {
+        const auto& report = calibration_sequence_.report();
+        auto& result = state.calibration_report;
+        result.stage = calibration_stage_name(report.stage);
+        result.error = report.error ? report.error : "none";
+        result.passed = report.passed; result.cancelled = report.cancelled;
+        result.attempts = report.attempts; result.point = report.point_index;
+        result.elapsed_s = (now - calibration_started_) * 1e-6f;
+        result.phase_response = report.phase_currents;
+        result.observed_d = report.observed_d; result.observed_q = report.observed_q;
+        result.tracking_error = report.tracking_error; result.saturation_fraction = report.saturation_fraction;
+        auto& q = result.quality;
+        q.method = report.passed ? 1 : 0;
+        q.current = report.current; q.voltage_limit = report.voltage_limit;
+        q.forward_points = report.forward_points; q.reverse_points = report.reverse_points;
+        q.verification_points = report.verify_points;
+        q.phase_check_passed = report.phase_check_passed;
+        const auto& fit = report.fit_result;
+        result.zero_forward = fit.forward_zero; result.zero_reverse = fit.reverse_zero;
+        q.measured_pole_pairs = fit.pole_pairs;
+        q.forward_pole_pairs = fit.forward_pole_pairs; q.reverse_pole_pairs = fit.reverse_pole_pairs;
+        q.direction_difference = fit.direction_difference; q.hysteresis_max = fit.hysteresis_max;
+        q.residual_rms = fit.residual_rms; q.residual_max = fit.residual_max;
+        q.verification_max = report.verification_max;
     }
     void IRAM_ATTR main() override {
         state.current_trip_limit = overcurrent_threshold(state.config.current_limit);
@@ -743,6 +798,22 @@ private:
             if (energized() && board_.trip()) {
                 if (board_.trip() == 1) capture_overcurrent();
                 fail(board_.trip() == 1 ? "overcurrent_isr" : "control_watchdog");
+            }
+            if (state.state == State::offsets && now - stage_start_ > 2000000) fail("current_offsets_timeout");
+            if (calibrating_) {
+                state.calibration_report.elapsed_s = (now - calibration_started_) * 1e-6f;
+                if (now - calibration_started_ > 121000000) fail("calibration_timeout");
+                else if (state.state != State::offsets) {
+                    const auto command = calibration_sequence_.check_timeout(now);
+                    if (command.error) { update_calibration_report(now); fail(command.error); }
+                    else if (command.reset_controller) {
+                        current_loop_.reset();
+                        if (command.current == 0 && command.voltage_d == 0) {
+                            if (board_.write_duty({0,0,0}) != ESP_OK) fail("pwm_failure");
+                            state.duty = {}; state.voltage_d = state.voltage_q = 0;
+                        }
+                    }
+                }
             }
 #if CONFIG_KNOB_DIAGNOSTICS
             if (state.state == State::active && torque_hold_.must_stop(now, angle_.angle(), angle_.velocity())) halt();
@@ -758,6 +829,10 @@ private:
 #endif
             if (received) {
                 const char* error = command(request, now);
+                // Scanning the unused stack on every status request can take
+                // a feedback period. Read its watermark only after stopping;
+                // the retained low-water mark still captures prior peak use.
+                if (!energized()) state.control_stack_free = uxTaskGetStackHighWaterMark(nullptr);
                 // Well-formed but refused commands cannot renew torque either.
                 if (!error && request.renew_lease) heartbeat_ = now;
                 Reply reply{error, state, request.id};
@@ -874,6 +949,10 @@ private:
                 // short sensor delay and resume automatically on a fresh frame.
                 ++state.timing_skips;
                 ++state.encoder_timing_skips;
+                if (calibrating_ && state.state != State::offsets) {
+                    const auto command = calibration_sequence_.invalidate(now);
+                    if (command.error) { update_calibration_report(now); fail(command.error); continue; }
+                }
                 if (energized() && encoder_action == EncoderFreshnessAction::zero_voltage)
                     zero_for_feedback_recovery();
                 continue;
@@ -897,6 +976,15 @@ private:
             }
             state.rejected = raw.rejected; state.sample_us = raw.duration_ticks / 80.0f;
             if (!valid_sample) {
+                // A request/duplicate notification can revisit a still-fresh
+                // frame. It contributes no evidence, but is not a rejected
+                // measurement and must not erase the qualification window.
+                if (calibrating_ && state.state != State::offsets &&
+                    (new_sample || now - raw.timestamp_us > SamplingRecovery::maximum_sample_age_us)) {
+                    const auto command = calibration_sequence_.invalidate(now);
+                    if (command.error) { update_calibration_report(now); fail(command.error); continue; }
+                    if (command.reset_controller) zero_for_feedback_recovery();
+                }
                 current_trip_filter_.step(CurrentTripLevel::invalid, 0);
                 if (new_sample || now - raw.timestamp_us > SamplingRecovery::maximum_sample_age_us) {
                     ++state.timing_skips;
@@ -930,7 +1018,7 @@ private:
 };
 class Console final : public AppTask {
 public:
-    explicit Console(Motor& motor) : AppTask("knob_console", 8192, 5, 0), motor_(motor) {}
+    explicit Console(Motor& motor) : AppTask("knob_console", 16384, 5, 0), motor_(motor) {}
 private:
     Motor& motor_;
     bool transact(const Request& request, Reply& reply, int64_t deadline) {
@@ -946,7 +1034,7 @@ private:
         return false;
     }
     void save_and_restart(const Request& request, Reply& reply) {
-        const bool saved = save_settings(reply.snapshot.config, reply.snapshot.calibration);
+        const bool saved = save_settings(reply.snapshot.config, reply.snapshot.calibration, reply.snapshot.calibration_quality);
         // An unsuccessful NVS write can also have suspended callbacks. Always
         // rebuild sampling after an attempted write, without clearing a fault.
         Request internal{};
@@ -1094,7 +1182,7 @@ private:
     bool on_initialize() override {
         // Never erase unrelated NVS when recovery is needed.
         if (nvs_flash_init() != ESP_OK) return false;
-        load_settings(motor_.state.config, motor_.state.calibration);
+        load_settings(motor_.state.config, motor_.state.calibration, motor_.state.calibration_quality);
         motor_.requests = xQueueCreate(1, sizeof(Request)); motor_.replies = xQueueCreate(1, sizeof(Reply));
         if (!motor_.requests || !motor_.replies) return false;
 #if CONFIG_KNOB_DIAGNOSTICS

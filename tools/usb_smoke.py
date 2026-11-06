@@ -30,7 +30,7 @@ def read_replies(device, ids):
                     replies[reply["id"]] = reply
             else:
                 line.append(byte)
-                require(len(line) <= 8192, "Oversize USB reply")
+                require(len(line) <= 16384, "Oversize USB reply")
     require(not pending, f"USB replies missing: {pending}")
     return replies
 
@@ -96,8 +96,7 @@ def main():
             require(device.request("status")["state"] == "idle", "Reconnect resumed torque")
         passed("20_reconnects_no_automatic_enable")
         device.request("enable")
-        time.sleep(.25)
-        require(device.request("status")["state"] == "active", "Enable did not complete")
+        device.wait_active()
         lease_ms = initial.get("host_lease_ms", 1000)
         deadline = time.monotonic() + max(1.3, lease_ms / 1000 + .3)
         while time.monotonic() < deadline:

@@ -1,10 +1,18 @@
 # SmartKnob USB 协议 v1
 
-2026-11-05 后续占空比实验已按用户要求回滚，当前仍为下述 v16 / 20 kHz / 65%。5 kHz / 90% 与 10 kHz / 85% 的声音均未通过，未改变当前协议默认值；详见[实验与最终恢复记录](duty90-20261105.md)。采样检查工具现按设备 `control_nominal_hz` 的 98% 设置默认有效频率门槛，并增加实际锁存 duty 验证与失败停止后续电流阶梯。
+当前固件为 **`dma-v19-bidirectional-calibration`**，协议仍为 v1，沿用 `20k65_sampling`、20 kHz PWM 和 5 kHz 控制。2026-11-05 的 5 kHz / 90% 与 10 kHz / 85% 占空比实验已按用户要求回滚，详见[实验与最终恢复记录](duty90-20261105.md)。采样检查工具按设备 `control_nominal_hz` 的 98% 设置默认有效频率门槛，并验证实际锁存 duty；失败后停止后续电流阶梯。
 
-## 2026-11-05 v16：转换完成校验与一致的两相采样
+## 2026-11-06 v19：双向校准、质量记录与结果保留
 
-当前源码报告 `firmware:"dma-v16-coherent-adc"`，默认 `pwm_profile:"20k65_sampling"`，协议仍为 v1。20 kHz 中心对齐 PWM 的 duty 为 0–65%，零脉宽下限仍为 0；活动电流环的电压能力为 **`0.65 × 有效实测母线 / √3`**。12 V 时约 4.503 V，相比 v10 的 90% 能力降低约 27.8%。这是当前采样时序允许的配置，不是 SVPWM 数学极限。90% / 100% 仍为显式实验选项，客户端必须读取实际 profile 和能力字段。
+每次 enable/calibrate 的零偏采集由历史 128 样本改为每相 4×128=512 个有效样本，检查均值、噪声、标准误和跨窗口漂移。校准再执行三相测量对应关系与极性检查、正反向各 29 点扫描、拟合及 6 个独立位置复核。默认初始电流 0.16 A、最高 0.25 A、电压上限 3 V，机械或拟合质量不足时有界重试；校准序列最多 120 秒，含零偏准备总计最多 121 秒。主机默认等 130 秒，以接收固件终态；固定的 0.2 秒 enable 等待已改为最多 2 秒的 active 状态轮询。
+
+新增 `calibration_report` 区分本次尝试与已接受结果，`calibration_quality` 为当前结果保存质量证据。只有全部通过才替换基础校准和质量；取消/失败保留旧结果、关闭输出，故障不自动清除。成功结果先进入 RAM，显式停机 save 才写入原 `settings_v1` 和新增 `cal_quality` 记录。详细请求、字段及持久化语义见下文，实机结果和门限见[校准记录](calibration-20261106.md)。
+
+完整状态扩展后主机应接受 **16384 字节**回复行。Console 栈同步由 8192 增至 16384 字节；`console_stack_free` / `control_stack_free` 报告对应任务的栈高水位剩余量。control_stack_free 只在电机未激励时重新读取，运行期返回上次缓存值，避免扫描控制任务栈干扰实时调度。新鲜 ADC 帧的重复任务通知不再清空校准窗口；仍跳过重复样本，保留过期/无效反馈和物理窗口保护。
+
+## 2026-11-05 v16：转换完成校验与一致的两相采样（历史基础，v19 沿用）
+
+该轮源码报告 `firmware:"dma-v16-coherent-adc"`，默认 `pwm_profile:"20k65_sampling"`，协议仍为 v1。20 kHz 中心对齐 PWM 的 duty 为 0–65%，零脉宽下限仍为 0；活动电流环的电压能力为 **`0.65 × 有效实测母线 / √3`**。12 V 时约 4.503 V，相比 v10 的 90% 能力降低约 27.8%。这是当前采样时序允许的配置，不是 SVPWM 数学极限。90% / 100% 仍为显式实验选项，客户端必须读取实际 profile 和能力字段。
 
 默认 20 kHz 路径的 `current_sampling` 为 `pwm_staggered_adc_done_experimental`。SAR ADC 时钟为 5 MHz；实际 START 目标位于 TEZ 前 2.25 µs，低侧建立预算仍为 6 µs，上升沿保护仍为 1 µs。完成窗口改用与本次 START 关联的独立 ADC1_DONE ISR 观测。DMA 回调用于数据传输和阶段推进，不再当成本次转换的完成上界。DONE ISR 也包含中断延迟，仍是保守观测，并非模拟采样孔径。
 
@@ -37,7 +45,7 @@ v10 源码报告 `firmware:"dma-v10-windowed-svpwm"`，默认 `pwm_profile:"20k9
 
 v9 `firmware:"dma-v9-sampling-fix"` 保留了 v8 的调制、电压能力和协议版本，修复第一槽跨 TEZ 正常锁存新 PWM 指令时的误拒绝；v10 沿用该修复和以下计数字段。首槽旧下降沿与新上升沿仍分别检查；指令一致性检查为 `after[0] == before[1] == after[1]`，不再额外要求首槽 `before[0] == after[0]`。
 
-`enable` / `calibrate` 进入零输出 offsets 时不再要求最新一帧物理有效；采样必须晚于重建边界、时间戳不在未来、年龄不超过 2 ms 且传输未失步。随后仍只消费有效样本，等待桥唤醒和每相至少 128 份合格零偏样本后才能进入 active/align。这样避免一帧偶发迟到造成整个准备流程取消；持续无效反馈不会被接纳为零偏或电流。
+`enable` / `calibrate` 进入零输出 offsets 时不再要求最新一帧物理有效；采样必须晚于重建边界、时间戳不在未来、年龄不超过 2 ms 且传输未失步。随后仍只消费有效样本，等待桥唤醒及足量合格零偏样本后才能进入 active/align；v9 当时为每相 128 份，v19 已扩展至每相 512 份和多窗口质量检查。这样避免一帧偶发迟到造成整个准备流程取消；持续无效反馈不会被接纳为零偏或电流。
 
 `rejected_samples` 是 HAL 拒绝的采样组总数，既包含真实窗口不足，也包含软件时序/完整性判断；不能标成“ADC 硬件转换失败”。新增字段如下：
 
@@ -66,7 +74,7 @@ HAL 原因计数和 `rejected_samples` 一样跨采样硬件重建保留、重�
 
 `firmware:"dma-v8-full-svpwm"` 默认报告 `pwm_profile:"20k100_svpwm"`，线性 SVPWM 使用 0–100% 软件占空比范围。`config` 不再包含 `voltage_limit`；完整配置也不需要该字段。旧客户端提交该字段时返回 `ok:false,error:"voltage_limit_automatic"`，配置和校准保持原值。客户端应删除电压上限输入控件，按只读 `effective_voltage_limit` 显示当前能力。
 
-| 字段 | v8/v9 全范围配置含义（当前默认能力见 v10） |
+| 字段 | v8/v9 全范围配置含义（当前默认 20k65 能力见上方 v16/v19 说明） |
 |---|---|
 | `voltage_limit_automatic` | true；电压能力由使用中的母线与调制范围计算，没有用户设定值 |
 | `pwm_duty_floor` / `pwm_duty_ceiling` | 默认完整范围为 0 / 1；实际指令仍由电流闭环计算 |
@@ -78,7 +86,7 @@ HAL 原因计数和 `rejected_samples` 一样跨采样硬件重建保留、重�
 | `pwm_peak_duty` | 从启动或采样硬件重建以来，HAL 按实际 TEZ 锁存的比较值统计到的最高占空比；不是尚未应用的 PI 指令 |
 | `pwm_full_duty_cycles` | 同一统计期间内至少一相实际锁存为 100% 比较值的 PWM 周期数；不能替代驱动器输出波形测量 |
 
-本工程默认启用已接线的 GPIO11 母线采样，每次控制使用当前有效实测值，最大电压能力随供电升降。关闭采样的构建只能使用 `config.bus_voltage`，无法检测真实供电波动。校准仍使用最多 0.8 V 的独立对齐限制。电压字段都是软件 dq 指令幅值，不是电机端电压外部测量；100% PWM 不等于 dq 电压幅值等于母线电压。
+本工程默认启用已接线的 GPIO11 母线采样，每次控制使用当前有效实测值，最大电压能力随供电升降。关闭采样的构建只能使用 `config.bus_voltage`，无法检测真实供电波动。v8–v16 的历史校准使用最多 0.8 V 的独立对齐限制；v19 使用 calibrate 请求的 voltage，默认上限 3 V，并受实时能力限制。电压字段都是软件 dq 指令幅值，不是电机端电压外部测量；100% PWM 不等于 dq 电压幅值等于母线电压。
 
 采样按两个实际测量相各自的低侧窗口校验，第三相由电流和为零重建。窗口不足的反馈不进入 PI，不清除既有过流暴露证据。偶发窗口或控制周期波动不再锁存 `adc_window_or_control_deadline`；连续无效超过约 2 ms 时请求零矢量恢复采样，保持桥使能，恢复后继续调节。这种恢复可能降低持续难采样角度下的平均输出，不能把 0–100% 指令范围解释为已保证连续 100% 实际输出。默认 20 kHz ADC 路径保留迟到回调所属 START，等待并完成原突发，超过 10 ms 仍未完成才标记失步并报告 `adc_transport_failure`；真实过流、无效/过期母线、编码器异常和控制任务真正停滞仍保留保护。
 
@@ -142,19 +150,19 @@ v6 已通过 14/14 桌面回归、ESP-IDF 构建并烧录 COM7，运行 ELF SHA2
 | `bus_voltage_raw` / `bus_voltage_adc_mv` | GPIO11 原始 12 位 ADC 码 / 校准后的引脚 mV；不是相电流 ADC 数据 |
 | `bus_voltage_error` | 最近读取或初始化的 ESP-IDF 错误码，0 表示成功；无效范围使用 `ESP_ERR_INVALID_RESPONSE` |
 | `bus_voltage_divider` | 分压换算倍率，默认约 11；由 `CONFIG_KNOB_BUS_DIVIDER_MILLI / 1000` 决定 |
-| `max_voltage_limit` / `available_voltage_limit` | 按实际使用母线计算的只读电压能力；默认完整 SVPWM 为 `bus_voltage / √3`，无效母线时为 0 |
+| `max_voltage_limit` / `available_voltage_limit` | 按实际使用母线计算的只读电压能力；当前默认 20k65 为 `0.65 × bus_voltage / √3`，完整 SVPWM 配置为 `bus_voltage / √3`，无效母线时为 0 |
 | `configured_max_voltage_limit` | 按名义配置母线计算的参考能力，不是可设置或实际使用的限幅 |
-| `effective_voltage_limit` | 等于 `available_voltage_limit`；active 电流环的电压矢量限制，校准仍另限至最多 0.8 V |
+| `effective_voltage_limit` | 等于 `available_voltage_limit`；active 电流环的电压矢量限制；v19 校准再受请求 voltage 限制（默认 3 V） |
 
 v8 取消手动电压上限，电源下降或上升时，可用上限与 PI 抗饱和限制均跟随变化。电压字段描述控制与调制能力，不是电机端电压的外部测量。PWM 频率和边界以当前设备报告的 `pwm_hz`、`pwm_profile`、`pwm_duty_floor`、`pwm_duty_ceiling` 为准。
 
 母线任务在 core 0 每 10 ms 读取 ADC2，不在电流 ISR 或电机任务中等待转换。ADC1 电流 DMA 不加入母线通道。开启采样后，初始化/读取错误、ADC 饱和、换算值低于 4.5 V 或高于 30 V 均不可用于驱动；运行时锁存 `bus_voltage_invalid`，样本年龄超过 100 ms 时锁存 `bus_voltage_stale`。尚未获得有效母线的 `enable` / `calibrate` 返回 `bus_voltage_not_ready`。停止后显式 `clear` 在母线仍无效时请求工作任务重新初始化，并清除旧快照；应轮询到新的 `bus_voltage_valid:true` 后再显式使能。读数恢复本身不清故障，也不自动重新启动。
 
-USB 发送改为每次最多 **512 字节**，修复扩展诊断回复超过 4096 字节时整段提交受 TX 环形缓冲区单项大小限制的问题。分块保留部分写入处理，整段 JSON 正文共用 100 ms 截止时间；线上格式和协议版本不变，客户端仍按 LF 拼接一条最长 8192 字节的回复，而不是把 512 字节当成报文边界。相电流绝对尺度仍待外部标定，新增母线读数不代表负载电流已完成验证。
+USB 发送改为每次最多 **512 字节**，修复扩展诊断回复超过 4096 字节时整段提交受 TX 环形缓冲区单项大小限制的问题。分块保留部分写入处理，整段 JSON 正文共用 100 ms 截止时间；线上格式和协议版本不变，客户端按 LF 拼接一条最长 16384 字节的回复，而不是把 512 字节当成报文边界。相电流绝对尺度仍待外部标定，新增母线读数不代表负载电流已完成验证。
 
 ## 传输与请求
 
-默认使用 DevKitC 的原生 USB Serial/JTAG（板上 USB 口，GPIO19/20）；主机统一以 115200、8N1、无流控打开串口，原生 USB 不受该波特率限制。编译时可选 COM/UART0，此时 115200 为实际线路速率。两者由 `CONFIG_KNOB_CONSOLE_USB` / `CONFIG_KNOB_CONSOLE_UART` 互斥选择，USB 能枚举或输出日志不能证明其已启用调参。每条请求/回复是一个 UTF-8 JSON 对象，以 LF 结束。请求最大 2047 字节；主机接受最多 8192 字节的一行。超长帧丢弃到 LF，不把尾部当成新命令。日志行不属于协议；默认 `CONFIG_ESP_CONSOLE_NONE=y` 避免应用日志与 JSON 混流。回复前后均带 LF，主机忽略空行与启动日志。一次请求对应一次回复，无主动推送。USB TX 支持部分写入并限制等待时间，后续帧前的 LF 可恢复被中断的帧边界。
+默认使用 DevKitC 的原生 USB Serial/JTAG（板上 USB 口，GPIO19/20）；主机统一以 115200、8N1、无流控打开串口，原生 USB 不受该波特率限制。编译时可选 COM/UART0，此时 115200 为实际线路速率。两者由 `CONFIG_KNOB_CONSOLE_USB` / `CONFIG_KNOB_CONSOLE_UART` 互斥选择，USB 能枚举或输出日志不能证明其已启用调参。每条请求/回复是一个 UTF-8 JSON 对象，以 LF 结束。请求最大 2047 字节；主机接受最多 16384 字节的一行。超长帧丢弃到 LF，不把尾部当成新命令。日志行不属于协议；默认 `CONFIG_ESP_CONSOLE_NONE=y` 避免应用日志与 JSON 混流。回复前后均带 LF，主机忽略空行与启动日志。一次请求对应一次回复，无主动推送。USB TX 支持部分写入并限制等待时间，后续帧前的 LF 可恢复被中断的帧边界。
 
 ```json
 {"id":1,"op":"status"}
@@ -168,13 +176,47 @@ USB 发送改为每次最多 **512 字节**，修复扩展诊断回复超过 409
 |---|---|
 | `status` | 查询全部快照，仅在启用 `KNOB_HOST_LEASE_MS` 时续期通讯租约 |
 | `configure` | 完整替换 `config`；先整体验证，失败时不修改任何参数 |
-| `calibrate` | 从 idle 开始电流零点、固定角对齐、一电周期慢扫、方向及电角度零点校准；对齐及收敛时必须通过平均 d/q 电流跟踪检查与连续 200 ms 的角度静止检测；完成后回到 idle |
-| `enable` | 必须已经校准且 idle；重采电流零点后启动手感 |
-| `disable` | 立即释放电机；已有 fault 保留，便于诊断 |
+| `calibrate` | 仅 idle 可开始：每相 512 样本零偏、三相对应关系/极性检查、正反向各 29 点、拟合和 6 点复核；允许有界升流重试；全部通过才发布结果并返回 idle，取消/失败保留旧结果 |
+| `enable` | 必须已经校准且 idle；每相重采 512 个有效零偏样本并通过质量检查后启动手感 |
+| `disable` | 立即释放电机；取消正在进行的校准并保留原已接受结果；已有 fault 保留 |
 | `clear` | 停机状态下清除锁存故障；初始化失败时重试硬件初始化 |
 | `zero` | 在当前位置重设逻辑档位中心，不改编码器 OTP 或电角度校准 |
 | `pulse` | active 时播放 3 ms 正向 + 3 ms 反向小电流脉冲，受电流限制和高速触觉衰减约束 |
-| `save` | 仅停机时，写入带版本/CRC 及编码器身份的 NVS 配置和校准；写入尝试后重建采样并返回新快照，保留已有故障，不保存或恢复 enabled 状态 |
+| `save` | 仅停机时，写入带版本/CRC 及编码器身份的 NVS 配置、校准和独立质量记录；写入尝试后重建采样并返回新快照，保留已有故障，不保存或恢复 enabled 状态 |
+
+## 校准请求与质量结果（v19）
+
+```json
+{"id":3,"op":"calibrate"}
+{"id":4,"op":"calibrate","current":0.16,"max_current":0.25,"voltage":3.0}
+```
+
+三个参数都是可选的顶层字段，省略时分别使用 0.16 A / 0.25 A / 3.0 V。请求必须满足 `0.02 ≤ current ≤ max_current ≤ 0.25` A 和 `0.05 ≤ voltage ≤ 3.0` V，max_current 不得超过当前 `config.current_limit`。只修改本次校准计划，不改 config。非数值/非有限参数返回 `calibration_parameters`；电流顺序或范围错误返回 `calibration_current_range`，电压越界返回 `calibration_voltage_range`，超运行电流预算返回 `calibration_exceeds_current_limit`，非 idle 返回 `idle_required`。
+
+正反向分别以 `j × π/2`、j=0…28 扫描 7 圈电角度，对本电机约一机械圈；保留连续角度，使用所有点拟合方向与极对数，以圆周平均求零点。极对数相对 7 的误差须 ≤3%，双向零点差 ≤0.12 rad、最大回差 ≤0.30 rad、残差 RMS ≤0.12 rad、最大残差 ≤0.35 rad；6 个非拟合位置的最大复核误差 ≤0.20 rad，均为电角度。电流跟踪、停稳和反馈有效性须同时满足。拟合数值不是替换固定整数 7 的运行极对数，而是质量证据。
+
+机械停稳或回差/方向偏差/残差失败时，电流可乘以 1.5、封顶 max_current 后重试，最多 3 次且共用序列 120 秒上限。电流跟踪、相检查、电压饱和及反馈异常不触发升流重试。含 offsets 的固件总上限为 121 秒；主机工具等待默认 130 秒，仅增加接收终态的余量。`calibration_check.py --firmware-defaults` 明确发送裸请求；不带该标志时，它显式发送主机默认参数，不能替代固件默认值测试。
+
+`calibration_report.stage` 正常路径为 `offsets → phase_check → align → forward → reverse → evaluate → align → verify → complete`，启动后尚未运行时为 `not_run`，退出还可能为 `failed` / `cancelled`。顶层 state 保持旧枚举：正反向扫描使用 sweep，拟合/复核使用 settle，其余激励阶段使用 align。主机应同时检查 idle、`calibration_report.passed:true`、`calibration_quality.verified:true` 和零输出；旧 `calibration.valid:true` 在新尝试期间仍可保留，不能单独作为成功判据。
+
+| 对象/字段 | 含义 |
+|---|---|
+| `calibration_quality.method` / `verified` | 当前已接受结果的方法和证据有效标志：`bidirectional_v1` / true，或 `legacy_or_unverified` / false |
+| `calibration_report.method` / `passed` / `cancelled` / `error` | 最近一次尝试的方法、通过/取消状态及原因；不随保存持久化，重启为 not_run |
+| `calibration_report.attempts` / `point` / `elapsed_s` | 当前尝试次数、阶段内点序号、校准已用秒数 |
+| `current` / `voltage_limit` | quality/report 共有；该次激励实际选用的电流 A 与计划电压幅值上限 V，不是外部实测电压 |
+| `forward_points` / `reverse_points` / `verification_points` | quality/report 共有；通过时分别为 29 / 29 / 6 |
+| `pole_pairs` / `forward_pole_pairs` / `reverse_pole_pairs` | quality/report 共有；拟合极对数及两个方向的独立拟合值 |
+| `direction_difference` / `hysteresis_max` / `residual_rms` / `residual_max` / `verification_max` | quality/report 共有；双向零点差、最大回差、残差 RMS/最大值和复核最大误差，电角度 rad |
+| `phase_check_passed` | quality/report 共有；仅使用独立采到的相电流完成对应关系/极性检查；不代表绝对感测增益已标定 |
+| `offset_noise_a[3]` / `offset_sem_a[3]` / `offset_drift_a[3]` | quality/report 共有；该次零偏噪声、名义均值标准误、扣除随机均值不确定度后的漂移，A |
+| `calibration_report.zero_forward` / `zero_reverse` | 两方向独立求得的电角度零点 rad |
+| `calibration_report.observed_d` / `observed_q` / `tracking_error` / `saturation_fraction` | 最近统计窗口的指令定子角坐标电流 A、跟踪误差 A、饱和样本比例；可解释等待/失败原因 |
+| `calibration_report.phase_a_response[3]` / `phase_b_response[3]` / `phase_c_response[3]` | 各相激励下的三通道独立采样均值 A；不采用重建相充当测量证据 |
+
+取消或失败时，旧 calibration 和 calibration_quality 保持不变；report 则记录新尝试的取消或失败。失败锁存 fault，disable 不清除，显式 clear 才尝试清除；不能自动清除后重新使能。新结果只在 RAM 中生效，直到停机 save。
+
+NVS 的 `smartknob/settings_v1` 基础配置/校准布局保留，另以 `cal_quality` 存放版本/CRC、完整基础校准、编码器身份、感测增益及质量指标。加载时须完整匹配且数值合格才恢复 verified；质量记录缺失、损坏或绑定不匹配时，基础校准仍按原校验恢复，但质量为 legacy_or_unverified。两记录保存不是突然断电下的原子事务。该质量证据不替代外部电流增益、机械转矩或绝对角度标定。
 
 ## 完整配置示例
 
@@ -268,7 +310,7 @@ v4 保留兼容字段 `detent_quiet_velocity:false`，实验性的两编码器�
 | `max_voltage_limit` | 当前配置母线下允许的配置电压上限；v5 不再固定限制为 5 V，实时能力另见 `available_voltage_limit`；不是实测电机端电压 |
 | `pwm_half_period_ticks` / `pwm_resolution_hz` | PWM 半周期计数和计数时钟；本实验分别为 4000 和 80000000，即每微秒 80 tick |
 
-这些诊断值与最新采样一起发布，不能仅凭一份低速 `status` 推断所有控制周期的行为。诊断读取仍每次最多返回 4 条记录，完整 JSON 回复须小于客户端 8192 字节行上限；追加字段会增加串口传输时间。
+这些诊断值与最新采样一起发布，不能仅凭一份低速 `status` 推断所有控制周期的行为。诊断读取仍每次最多返回 4 条记录，完整 JSON 回复须小于客户端 16384 字节行上限；追加字段会增加串口传输时间。
 
 `reset_reason` 是 ESP-IDF 复位原因枚举，`uptime_ms` 是本次启动时间，`minimum_free_heap` 是启动后最小剩余堆内存字节数；这些字段用于区分端口异常、设备复位和资源问题。
 
@@ -278,9 +320,10 @@ v4 保留兼容字段 `detent_quiet_velocity:false`，实验性的两编码器�
 
 - `state`：idle/offsets/align/sweep/settle/active/fault；命令已接受与校准已完成是两个不同事件，应继续轮询状态。
 - `angle` / `velocity`：连续机械角度 rad / rad/s；`position` 和 `sub_position` 是逻辑档位及其小数偏移。`velocity` 采用 10 ms 滤波用于高速包络；`velocity_fast` 采用 0.5 ms 滤波用于阻尼和弹性回程限速，减少反转时的控制滞后。
-- `id_current` / `iq`：电角度坐标下的 A；只有 `current_valid:true` 时代表有效电流。休眠/校准零点/无效采样期间不得把保留值绘成实时曲线。`target` 是编码器方向的目标 A。作电流曲线时 q 轴目标为 `target * calibration.direction`。
+- `id_current` / `iq`：电角度坐标下的 A；只有 `current_valid:true` 时代表有效电流。普通运行使用转子电角度，校准使用指令定子角，固定参考系诊断另见 diagnostic.reference。休眠/校准零点/无效采样期间不得把保留值绘成实时曲线。`target` 是编码器方向的目标 A。作普通运行电流曲线时 q 轴目标为 `target * calibration.direction`。
 - `currents`：重建后的 U/V/W A；每次取两相，第三相由和为零重建，感测相对按轮换更新。
 - `sense_volts` / `offsets`：三个通道最近电压及零点 V。
+- 顶层 `offset_noise_a` / `offset_sem_a` / `offset_drift_a`：最近一次 enable/calibrate 零偏采集的质量，A；与 calibration_quality 内绑定已接受校准的那次零偏数据分开。
 - `duty`：三相占空比；`sample_us`：PWM 同步 ADC 两相有效采集窗口的耗时（不含尾部 DMA 刷新）；`loop_us`：本次任务计算耗时；`rejected_samples`：启动后的累计无效采样数；`reused_samples`：重复任务通知对应已处理样本的累计次数，此类通知跳过，不重复控制也不计作 ADC 失败。
 - `magnet`：所选编码器的原始磁场状态。MT6701 为 Mg[3:0]：低两位 0=正常、1=过强、2=过弱、3=保留且拒绝，bit 3 为失去跟踪，bit 2 为按压检测；正常角度可伴随 bit 2，因此不能仅判断 `magnet == 0`。AS5600 为原始 STATUS，正常有效位为 `(magnet & 0x38) == 0x20`（MD=1，MH=ML=0），不能用原值严格等于 0x20 判断。`weak_magnet_allowed` 仅在 AS5600 后端且启用对应 Kconfig 时为 true；MT6701 始终为 false。
 - `hardware_detail` / `hardware_error`：初始化失败操作及 ESP-IDF 错误码；`sample_start_tick` / `sample_end_tick` 是采样相对 TEZ 的有符号 80 MHz 时钟位置，用于检查低侧窗口。
@@ -298,6 +341,7 @@ v4 保留兼容字段 `detent_quiet_velocity:false`，实验性的两编码器�
 - `fault_current_valid` / `fault_currents` / `fault_current_trip_limit`：首次过流停机时的有效标志、U/V/W 电流 A 和当时持续过流阈值 A；锁存至 `clear`，不受停机后失效的实时电流影响。`fault_motion` 另锁存过流时最近的 angle / velocity / velocity_fast，避免将停机后速度误当作故障时速度。上述可选字段不改变协议版本。
 - `haptic_scale`：实际触觉力度系数 0–1；非 active 状态为 0。`speed_limited` 表示力度尚未完全恢复；`haptic_paused` 表示达到高速阈值后仍等待减速，暂停刚开始的淡出阶段系数可以大于 0。`haptic_fade_start` / `haptic_speed_cutoff` 是渐弱及暂停阈值（rad/s，当前 25 / 40）。`haptic_resume_speed` 为恢复速度（5 rad/s），`haptic_resume_hold_ms` 为低速保持时间（约 30 ms），`haptic_fade_in_ms` 为完整恢复时间（500 ms）。这些是可选遥测字段；旧上位机可忽略，协议仍为 v1。
 - `calibration`：valid、direction（±1）、pole_pairs（固定 7）、electrical_zero（rad）。NVS 同时保存编码器身份；读取旧版本时将其视为 AS5600 校准。与当前源码所选类型不匹配时仍恢复 `config`，但 `calibration.valid` 为 false，`enable` 返回 `calibrate_first`。重新校准并在停机后 `save`，才保存新编码器的校准。更换同型号传感器或调整机械安装也应重新校准，类型身份不能自动识别这类机械变化。
+- `calibration_quality` / `calibration_report`：分别为已接受结果的质量证据和最近一次尝试，详见“校准请求与质量结果”。取消或失败只更新后者，不能据后者覆盖仍被保留的已接受结果。
 
 设备不自动重连、不自动清除或恢复锁存故障。正常 active 会话中的高速触觉衰减会按上述阈值自动恢复；这不解除任何锁存故障。上位机在每次回复后等待约 40 ms 再轮询；完整 JSON 在 115200 baud 下的传输耗时也计入实际刷新周期。退出/切换产品/关闭窗口会停机并释放串口。默认 `KNOB_HOST_LEASE_MS=0`，USB 丢失或停止查询不会单独触发停机；设备保持已明确启用的手感。退出软件时应显式发送 disable。需要通讯租约的产品可在构建时设置正数毫秒值，此时仅成功接受的命令续期，超时锁存 `host_timeout`。
 
@@ -324,7 +368,7 @@ d 轴驱动期满后立即请求零电压，观察阶段继续保持零输出；
 
 可选 `diagnostic` 对象含 busy、cancelled、axis、reference、stage、count、peak_speed、peak_current、muted_samples、recovered。stage：0=空闲，1=准备，2=测试驱动，3=释放，4=完成，5=中止，6=普通手拨记录中，7=手拨记录已冻结。recovered 表示 q 轴释放阶段经历完整静音后力度恢复到 1；不等同于机械已完全静止，也不是 d 轴诊断的电流跟踪验收值。q 轴驱动阶段的测试电流用于模拟外部甩转，因此不受触觉静音系数影响，仍受电流限制约束。
 
-样本为数组：`[elapsed_us, angle, velocity, target, iq, id_current, haptic_scale, voltage_q, phase_peak, flags, velocity_fast, voltage_d, adc_raw_a, adc_raw_b, sample_start_tick, sample_end_tick]`，加速/释放测试间隔约 2 ms，容量 2048。v2 在旧版 12 项数组末尾追加两相原始 ADC 码及采样窗口时刻，便于排查孤立电流尖峰；读取旧固件时应接受缺少末尾四项。flags 的低 8 位为 stage，bit 8 为 haptic_paused，bit 9 为 speed_limited，bits 16–17 / 18–19 为两次实际采样的相号 0/1/2。电流方向与普通遥测相同。取回样本仍使用原协议身份、请求 ID 和 8192 字节主机回复缓冲上限（请求上限仍为 2048 字节）。
+样本为数组：`[elapsed_us, angle, velocity, target, iq, id_current, haptic_scale, voltage_q, phase_peak, flags, velocity_fast, voltage_d, adc_raw_a, adc_raw_b, sample_start_tick, sample_end_tick]`，加速/释放测试间隔约 2 ms，容量 2048。v2 在旧版 12 项数组末尾追加两相原始 ADC 码及采样窗口时刻，便于排查孤立电流尖峰；读取旧固件时应接受缺少末尾四项。flags 的低 8 位为 stage，bit 8 为 haptic_paused，bit 9 为 speed_limited，bits 16–17 / 18–19 为两次实际采样的相号 0/1/2。电流方向与普通遥测相同。取回样本使用原协议身份、请求 ID 和 16384 字节主机回复缓冲上限（请求正文最大 2047 字节）。
 
 v10 d 轴诊断在该数组末尾追加第 17 项 `target_d`，q 轴诊断仍为 16 项。d 轴采集间隔为 `max(200, ceil((drive_us + observe_us) / 2047))` µs，以便 2048 点缓冲覆盖较长测试；有效采样不足时实际记录可能更稀疏。USB 快照均值和这类抽取记录不是完整 5 kHz 电流纹波。
 
@@ -334,7 +378,7 @@ v10 d 轴诊断在该数组末尾追加第 17 项 `target_d`，q 轴诊断仍为
 
 诊断构建的普通 enable 会复用记录缓冲，以完整控制频率滚动记录最近 2048 个样本（约 410 ms）；disable 或故障后冻结，可通过 diagnostic_read 取出，记录中读取会返回 disable_before_trace_read。手拨记录 flags 的 bit 10 表示 quiet_output，bits 16–17 / 18–19 为两次实际采样的相号 0/1/2。`tools/exercise.py --capture` 在停止后自动保存 `.trace.json`，用于排查 USB 低速查询看不到的快速电流变化。正常构建没有此缓冲或自动记录。
 
-`diagnostic_restore_calibration` 仅在诊断构建、idle 且无正在执行的诊断时接受，用于将同一设备烧录前备份的校准恢复到 RAM。请求包含 `encoder` 字符串和完整 `calibration` 对象；编码器名称必须等于当前构建名称，valid 必须为 true，direction 为 ±1，pole_pairs 为 7，electrical_zero 为 `[0, 2π)` 内有限数。身份不符返回 `calibration_identity`，字段不合法返回 `invalid_calibration`，非 idle 返回 `idle_required`。调用只恢复 RAM 校准，不使能、不改配置、不写 NVS。
+`diagnostic_restore_calibration` 仅在诊断构建、idle 且无正在执行的诊断时接受，用于将同一设备烧录前备份的校准恢复到 RAM。请求包含 `encoder` 字符串和完整 `calibration` 对象；编码器名称必须等于当前构建名称，valid 必须为 true，direction 为 ±1，pole_pairs 为 7，electrical_zero 为 `[0, 2π)` 内有限数。身份不符返回 `calibration_identity`，字段不合法返回 `invalid_calibration`，非 idle 返回 `idle_required`。调用只恢复 RAM 基础校准，并清除 calibration_quality 的验证标记；不使能、不改配置、不写 NVS。
 
 例如，使用已经读回并保存的完整状态 `backup`：
 

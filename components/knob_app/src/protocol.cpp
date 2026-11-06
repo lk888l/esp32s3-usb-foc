@@ -7,6 +7,8 @@
 #include "esp_system.h"
 #include "esp_app_desc.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <cmath>
 #include <cstring>
 #include <cstddef>
@@ -32,6 +34,26 @@ void numeric_array(cJSON* obj, const char* name, const std::array<T, N>& values)
     cJSON_AddItemToObject(obj, name, cJSON_CreateDoubleArray(numbers.data(), N));
 }
 struct Stored { uint32_t version; Config config; Calibration calibration; uint32_t crc; };
+struct StoredQuality { SavedCalibrationQuality record; uint32_t crc; };
+void quality_fields(cJSON* object, const CalibrationQuality& q) {
+    cJSON_AddNumberToObject(object, "current", q.current);
+    cJSON_AddNumberToObject(object, "voltage_limit", q.voltage_limit);
+    cJSON_AddNumberToObject(object, "forward_points", q.forward_points);
+    cJSON_AddNumberToObject(object, "reverse_points", q.reverse_points);
+    cJSON_AddNumberToObject(object, "verification_points", q.verification_points);
+    cJSON_AddNumberToObject(object, "pole_pairs", q.measured_pole_pairs);
+    cJSON_AddNumberToObject(object, "forward_pole_pairs", q.forward_pole_pairs);
+    cJSON_AddNumberToObject(object, "reverse_pole_pairs", q.reverse_pole_pairs);
+    cJSON_AddNumberToObject(object, "direction_difference", q.direction_difference);
+    cJSON_AddNumberToObject(object, "hysteresis_max", q.hysteresis_max);
+    cJSON_AddNumberToObject(object, "residual_rms", q.residual_rms);
+    cJSON_AddNumberToObject(object, "residual_max", q.residual_max);
+    cJSON_AddNumberToObject(object, "verification_max", q.verification_max);
+    cJSON_AddBoolToObject(object, "phase_check_passed", q.phase_check_passed);
+    array(object, "offset_noise_a", q.noise_a);
+    array(object, "offset_sem_a", q.sem_a);
+    array(object, "offset_drift_a", q.drift_a);
+}
 }
 const char* decode_request(const char* line, Request& r) {
     const char* end = nullptr;
@@ -55,6 +77,18 @@ const char* decode_request(const char* line, Request& r) {
     bool found = false;
     for (auto n : names) if (!std::strcmp(op->valuestring, n.name)) { r.op = n.op; found = true; }
     if (!found) return fail("unknown_op");
+    if (r.op == Op::calibrate) {
+        struct Parameter { const char* name; float CalibrationPlan::*member; };
+        constexpr Parameter parameters[] = {{"current", &CalibrationPlan::current},
+            {"max_current", &CalibrationPlan::max_current}, {"voltage", &CalibrationPlan::voltage_limit}};
+        for (const auto parameter : parameters) {
+            const auto* item = cJSON_GetObjectItemCaseSensitive(root, parameter.name);
+            if (!item) continue;
+            if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble)) return fail("calibration_parameters");
+            r.calibration_plan.*(parameter.member) = static_cast<float>(item->valuedouble);
+        }
+        if (const char* error = validate_calibration_plan(r.calibration_plan)) return fail(error);
+    }
 #if CONFIG_KNOB_DIAGNOSTICS
     if (r.op == Op::diagnostic_restore_calibration) {
         const auto* encoder = cJSON_GetObjectItemCaseSensitive(root, "encoder");
@@ -141,7 +175,9 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "id", id);
     cJSON_AddStringToObject(root, "device", "smartknob-s3");
     cJSON_AddNumberToObject(root, "protocol", 1);
-    cJSON_AddStringToObject(root, "firmware", "dma-v16-coherent-adc");
+    cJSON_AddNumberToObject(root, "control_stack_free", s.control_stack_free);
+    cJSON_AddNumberToObject(root, "console_stack_free", uxTaskGetStackHighWaterMark(nullptr));
+    cJSON_AddStringToObject(root, "firmware", "dma-v19-bidirectional-calibration");
     cJSON_AddStringToObject(root, "pwm_profile", pwm_profile_name);
     const auto* app = esp_app_get_description();
     char app_sha256[65]{};
@@ -366,26 +402,72 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON* cal = cJSON_AddObjectToObject(root, "calibration");
     cJSON_AddBoolToObject(cal, "valid", s.calibration.valid); cJSON_AddNumberToObject(cal, "direction", s.calibration.direction);
     cJSON_AddNumberToObject(cal, "pole_pairs", s.calibration.pole_pairs); cJSON_AddNumberToObject(cal, "electrical_zero", s.calibration.electrical_zero);
+    cJSON* quality = cJSON_AddObjectToObject(root, "calibration_quality");
+    cJSON_AddStringToObject(quality, "method", s.calibration_quality.method == 1 ? "bidirectional_v1" : "legacy_or_unverified");
+    cJSON_AddBoolToObject(quality, "verified", s.calibration_quality.method == 1);
+    quality_fields(quality, s.calibration_quality);
+    cJSON* report = cJSON_AddObjectToObject(root, "calibration_report");
+    cJSON_AddStringToObject(report, "method", "bidirectional_v1");
+    cJSON_AddStringToObject(report, "stage", s.calibration_report.stage);
+    cJSON_AddStringToObject(report, "error", s.calibration_report.error);
+    cJSON_AddBoolToObject(report, "passed", s.calibration_report.passed);
+    cJSON_AddBoolToObject(report, "cancelled", s.calibration_report.cancelled);
+    cJSON_AddNumberToObject(report, "attempts", s.calibration_report.attempts);
+    cJSON_AddNumberToObject(report, "point", s.calibration_report.point);
+    cJSON_AddNumberToObject(report, "elapsed_s", s.calibration_report.elapsed_s);
+    cJSON_AddNumberToObject(report, "zero_forward", s.calibration_report.zero_forward);
+    cJSON_AddNumberToObject(report, "zero_reverse", s.calibration_report.zero_reverse);
+    cJSON_AddNumberToObject(report, "observed_d", s.calibration_report.observed_d);
+    cJSON_AddNumberToObject(report, "observed_q", s.calibration_report.observed_q);
+    cJSON_AddNumberToObject(report, "tracking_error", s.calibration_report.tracking_error);
+    cJSON_AddNumberToObject(report, "saturation_fraction", s.calibration_report.saturation_fraction);
+    quality_fields(report, s.calibration_report.quality);
+    for (unsigned phase = 0; phase < 3; ++phase) {
+        const char* key = phase == 0 ? "phase_a_response" : phase == 1 ? "phase_b_response" : "phase_c_response";
+        array(report, key, s.calibration_report.phase_response[phase]);
+    }
+    array(root, "offset_noise_a", s.offset_noise_a);
+    array(root, "offset_sem_a", s.offset_sem_a);
+    array(root, "offset_drift_a", s.offset_drift_a);
     return root;
 }
-bool load_settings(Config& c, Calibration& cal) {
+bool load_settings(Config& c, Calibration& cal, CalibrationQuality& quality) {
     nvs_handle_t handle;
     if (nvs_open("smartknob", NVS_READONLY, &handle) != ESP_OK) return false;
     Stored data{}; size_t length = sizeof(data);
-    const auto err = nvs_get_blob(handle, "settings_v1", &data, &length); nvs_close(handle);
+    const auto err = nvs_get_blob(handle, "settings_v1", &data, &length);
+    StoredQuality saved_quality{}; size_t quality_length = sizeof(saved_quality);
+    const auto quality_error = nvs_get_blob(handle, "cal_quality", &saved_quality, &quality_length);
+    nvs_close(handle);
     if (err != ESP_OK || length != sizeof(data) ||
         data.crc != esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&data), offsetof(Stored, crc))) return false;
-    return restore_encoder_settings(data.version, data.config, data.calibration,
-                                    encoder_config::calibration_id, c, cal);
+    if (!restore_encoder_settings(data.version, data.config, data.calibration,
+                                  encoder_config::calibration_id, c, cal)) return false;
+    quality = {};
+    if (quality_error == ESP_OK && quality_length == sizeof(saved_quality) &&
+        saved_quality.crc == esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&saved_quality), offsetof(StoredQuality, crc)) &&
+        quality_matches(saved_quality.record, cal, encoder_config::calibration_id, c.sense_gain))
+        quality = saved_quality.record.quality;
+    return true;
 }
-bool save_settings(const Config& c, const Calibration& cal) {
+bool save_settings(const Config& c, const Calibration& cal, const CalibrationQuality& quality) {
     if (validate(c) || (cal.valid && !valid_calibration(cal))) return false;
+    StoredQuality saved_quality{};
+    saved_quality.record.calibration = cal;
+    saved_quality.record.encoder_id = encoder_config::calibration_id;
+    saved_quality.record.sense_gain = c.sense_gain;
+    saved_quality.record.quality = quality;
+    if (quality.method != 0 && !quality_matches(saved_quality.record, cal, encoder_config::calibration_id, c.sense_gain)) return false;
+    saved_quality.crc = esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&saved_quality), offsetof(StoredQuality, crc));
     nvs_handle_t handle;
     if (nvs_open("smartknob", NVS_READWRITE, &handle) != ESP_OK) return false;
     Stored data{}; data.version = encoder_settings_version(encoder_config::calibration_id);
     data.config = c; data.calibration = cal;
     data.crc = esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&data), offsetof(Stored, crc));
-    const bool ok = nvs_set_blob(handle, "settings_v1", &data, sizeof(data)) == ESP_OK && nvs_commit(handle) == ESP_OK;
+    // A stale/partially saved sidecar is never trusted: it is bound to the exact
+    // encoder, gain and calibration above and independently CRC-protected.
+    const bool ok = nvs_set_blob(handle, "cal_quality", &saved_quality, sizeof(saved_quality)) == ESP_OK &&
+        nvs_set_blob(handle, "settings_v1", &data, sizeof(data)) == ESP_OK && nvs_commit(handle) == ESP_OK;
     nvs_close(handle); return ok;
 }
 }
