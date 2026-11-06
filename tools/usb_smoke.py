@@ -53,9 +53,10 @@ def main():
         require(initial["bus_voltage_valid"], "Bus voltage is unavailable")
         require(math.isclose(initial["effective_voltage_limit"], initial["available_voltage_limit"], rel_tol=1e-5),
                 "Automatic voltage capacity differs from the effective limit")
-        if initial["pwm_duty_ceiling"] == 1:
-            require(math.isclose(initial["effective_voltage_limit"], initial["bus_voltage"] / math.sqrt(3), rel_tol=1e-5),
-                    "Full SVPWM capacity does not follow the live bus")
+        if initial["pwm_min_active_duty"] == 0:
+            require(math.isclose(initial["effective_voltage_limit"],
+                                 initial["bus_voltage"] * initial["pwm_duty_ceiling"] / math.sqrt(3), rel_tol=1e-5),
+                    "SVPWM capacity does not follow the live bus and duty ceiling")
         refused = device.request("configure", {**initial["config"], "voltage_limit": .8}, allow_error=True)
         require(not refused["ok"] and refused["error"] == "voltage_limit_automatic",
                 "Retired voltage field was not explicitly rejected")

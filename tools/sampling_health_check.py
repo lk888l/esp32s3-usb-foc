@@ -31,8 +31,8 @@ def summarize(report, args):
               "pulse_rejected": sum(not p["ok"] for p in report["pulses"]),
               "transport": report.get("initial", {}).get("transport"),
               "transport_errors": report["transport_errors"], "fault": report.get("fault", "none"),
-              "thresholds": {"max_reject_ratio": args.max_reject_ratio,
-                             "min_control_hz": args.min_control_hz}}
+              "thresholds": report.get("thresholds", {"max_reject_ratio": args.max_reject_ratio,
+                                                       "min_control_hz": args.min_control_hz})}
     if first is None or last is None:
         result["criteria"] = {"measurement_complete": False}
         return result
@@ -51,8 +51,10 @@ def summarize(report, args):
         "counters_valid": counter_valid,
         "fault_free": result["fault"] == "none",
         "transport_ok": not report["transport_errors"] and reasons["transport"] == 0,
+        "pair_coherent": reasons["pair_change"] == 0,
+        "feedback_uninterrupted": delta["sampling_recoveries"] == 0,
         "reject_ratio": ratio is not None and ratio < args.max_reject_ratio,
-        "control_hz": hz is not None and hz > args.min_control_hz,
+        "control_hz": hz is not None and hz > result["thresholds"]["min_control_hz"],
         "pulse_commands_accepted": (args.pulse_interval == 0 or
                                     result["pulse_attempts"] > 0 and result["pulse_rejected"] == 0),
     }
@@ -106,6 +108,12 @@ def run_check(args):
             report["fault"] = initial["fault"]
             require(initial["state"] == "idle" and initial["fault"] == "none", "Idle, fault-free device required")
             require(initial["calibration"]["valid"], "Existing valid calibration required")
+            nominal_hz = initial.get("control_nominal_hz")
+            require(isinstance(nominal_hz, (int, float)) and math.isfinite(nominal_hz) and nominal_hz > 0,
+                    "Firmware lacks a valid nominal control rate")
+            minimum_hz = args.min_control_hz if args.min_control_hz is not None else .98 * nominal_hz
+            report["thresholds"] = {"control_nominal_hz": nominal_hz, "min_control_hz": minimum_hz,
+                                    "max_reject_ratio": args.max_reject_ratio}
             original, calibration = initial["config"].copy(), initial["calibration"].copy()
             require(all(key in initial for key in COUNTERS) and
                     all(key in initial.get("adc_reject_counts", {}) for key in REASONS),
@@ -212,7 +220,8 @@ def main():
     parser.add_argument("--mode", type=int, choices=range(4), help="Optional RAM-only mode override; default preserves current mode")
     parser.add_argument("--pulse-interval", type=float, default=.4, help="Seconds between firmware-bounded pulses; 0 disables")
     parser.add_argument("--max-reject-ratio", type=float, default=.01)
-    parser.add_argument("--min-control-hz", type=float, default=4900)
+    parser.add_argument("--min-control-hz", type=float,
+                        help="Minimum effective control rate; defaults to 98%% of device control_nominal_hz")
     args = parser.parse_args()
     if not math.isfinite(args.seconds) or not 0 < args.seconds <= 120:
         parser.error("--seconds must be in (0, 120]")
@@ -220,7 +229,7 @@ def main():
         parser.error("--pulse-interval must be finite and nonnegative")
     if not math.isfinite(args.max_reject_ratio) or not 0 < args.max_reject_ratio <= 1:
         parser.error("--max-reject-ratio must be in (0, 1]")
-    if not math.isfinite(args.min_control_hz) or args.min_control_hz <= 0:
+    if args.min_control_hz is not None and (not math.isfinite(args.min_control_hz) or args.min_control_hz <= 0):
         parser.error("--min-control-hz must be finite and positive")
     if args.output.exists():
         parser.error("--output already exists; use a new report path")
