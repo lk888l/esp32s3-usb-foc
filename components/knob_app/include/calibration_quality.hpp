@@ -89,4 +89,17 @@ inline bool quality_matches(const SavedCalibrationQuality& saved, const Calibrat
         saved.calibration.electrical_zero == calibration.electrical_zero && valid_calibration_quality(saved.quality);
 }
 
+// Restore an explicit RAM backup only after the complete replacement and its
+// optional evidence pass validation. The motor task owns both destinations,
+// so no status reply can expose a new calibration with the old quality record.
+inline bool restore_calibration_with_quality(const Calibration& restored,
+        const SavedCalibrationQuality* evidence, uint32_t encoder_id, float sense_gain,
+        Calibration& calibration, CalibrationQuality& quality) {
+    if (!valid_calibration(restored) ||
+        (evidence && !quality_matches(*evidence, restored, encoder_id, sense_gain))) return false;
+    calibration = restored;
+    quality = evidence ? evidence->quality : CalibrationQuality{};
+    return true;
+}
+
 } // namespace knob

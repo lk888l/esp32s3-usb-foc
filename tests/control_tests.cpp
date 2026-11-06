@@ -134,11 +134,13 @@ static void test_zero_floor_modulation() {
     if constexpr (pwm_full_range) {
         assert(duty_ceiling == 1);
         assert(near(max_output_voltage(12), 6.928203f));
-    } else if constexpr (duty_ceiling == .65f) {
-        assert(pwm_profile_hz == 20000 && duty_ceiling == .65f);
-        assert(near(max_output_voltage(12), 4.503332f));
-        // The quantized ceiling reserves 700 timer ticks on each side of TEZ.
-        assert(std::lround(2000 * (1 - duty_ceiling)) == 700);
+    } else if constexpr (pwm_sampling_window_constrained) {
+        constexpr uint32_t half_period = sampling_timing::resolution_hz / (2 * pwm_profile_hz);
+        assert(pwm_profile_hz == 20000 || pwm_profile_hz == 15000);
+        assert(near(max_output_voltage(12), duty_ceiling * 12 / std::sqrt(3.0f)));
+        // Quantized PWM must reserve the acquisition envelope at either
+        // carrier rate, including the optional faster digital ADC controller.
+        assert(std::lround(half_period * (1 - duty_ceiling)) == sampling_timing::minimum_compare_ticks);
     } else {
         assert(pwm_profile_hz == 20000 && duty_ceiling == .90f);
         assert(near(max_output_voltage(12), 6.235383f));

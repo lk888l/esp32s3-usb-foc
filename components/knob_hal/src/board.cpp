@@ -187,7 +187,7 @@ bool IRAM_ATTR Board::on_full(mcpwm_timer_handle_t, const mcpwm_timer_event_data
     mcpwm_ll_intr_clear_status(&MCPWM0, MCPWM_LL_EVENT_CMP_EQUAL(0, 1));
     mcpwm_ll_intr_enable(&MCPWM0, MCPWM_LL_EVENT_CMP_EQUAL(0, 1), true);
     const int64_t now = esp_timer_get_time();
-    if (b.last_tep_us_ && now - b.last_tep_us_ > 1000000 / pwm_hz * 3 / 2)
+    if (b.last_tep_us_ && now - b.last_tep_us_ > (3 * half_period + resolution / 1000000 - 1) / (resolution / 1000000))
         b.pwm_tracking_failed_ = true;
     b.last_tep_us_ = now;
     // Same-core motor task and MCPWM ISRs own these values. Preserve the
@@ -212,7 +212,7 @@ bool IRAM_ATTR Board::on_full(mcpwm_timer_handle_t, const mcpwm_timer_event_data
         }
     }
     BaseType_t wake = pdFALSE;
-    if (++b.encoder_divider_ >= pwm_hz / encoder_hz) {
+    if (++b.encoder_divider_ >= encoder_divider) {
         b.encoder_divider_ = 0;
         const auto encoder_task = b.encoder_task_.load(std::memory_order_relaxed);
         if (encoder_task) vTaskNotifyGiveFromISR(encoder_task, &wake);
@@ -281,7 +281,7 @@ bool IRAM_ATTR Board::on_empty(mcpwm_timer_handle_t, const mcpwm_timer_event_dat
     }
     const auto counter = pwm_counter();
     const int64_t now = esp_timer_get_time();
-    constexpr uint32_t period_us = 1000000 / pwm_hz;
+    constexpr uint32_t period_us = (2 * half_period + resolution / 1000000 - 1) / (resolution / 1000000);
     const uint32_t phase_ticks = counter.phase_ticks(half_period);
     // TEZ already moved the old shadow into hardware before this callback.
     // Never substitute the new shadow we are about to write for that value.
@@ -338,7 +338,7 @@ bool IRAM_ATTR Board::on_sample(mcpwm_cmpr_handle_t, const mcpwm_compare_event_d
         // selected ADC/control rate. +15 us stays close to the former DMA
         // publication phase without halving encoder bandwidth at 2 kHz.
         BaseType_t wake = pdFALSE;
-        if (++b.encoder_divider_ >= pwm_hz / encoder_hz) {
+        if (++b.encoder_divider_ >= encoder_divider) {
             b.encoder_divider_ = 0;
             const auto encoder_task = b.encoder_task_.load(std::memory_order_relaxed);
             if (encoder_task) vTaskNotifyGiveFromISR(encoder_task, &wake);
@@ -350,7 +350,7 @@ bool IRAM_ATTR Board::on_sample(mcpwm_cmpr_handle_t, const mcpwm_compare_event_d
         // Three conversions at one common carrier phase in successive cycles;
         // the remaining cycle(s) preserve the configured control cadence.
         const unsigned cadence_slot = b.divider_;
-        b.divider_ = (b.divider_ + 1) % (pwm_hz / control_hz);
+        b.divider_ = (b.divider_ + 1) % control_divider;
         if (b.adc_desynchronized_) {
             if (cadence_slot == 0) {
                 auto missing = b.pending_sample_; missing.reject(adc_reject_transport);
@@ -419,7 +419,7 @@ bool IRAM_ATTR Board::on_sample(mcpwm_cmpr_handle_t, const mcpwm_compare_event_d
         s.end_tick = trigger.signed_tick();
         return false;
     }
-    if (++b.divider_ < pwm_hz / control_hz) return false;
+    if (++b.divider_ < control_divider) return false;
     b.divider_ = 0;
     if (b.adc_desynchronized_) {
         auto missing = b.pending_sample_; missing.reject(adc_reject_transport);
@@ -742,7 +742,7 @@ esp_err_t Board::write_voltage(Dq voltage, float sample_electrical_angle,
         enable(false); return ESP_ERR_INVALID_ARG;
     }
     constexpr uint32_t period_ticks = 2 * half_period;
-    constexpr uint32_t period_us = 1000000 / pwm_hz;
+    constexpr uint32_t period_us = (2 * half_period + resolution / 1000000 - 1) / (resolution / 1000000);
     constexpr uint32_t ticks_per_us = resolution / 1000000;
     constexpr uint32_t commit_guard_ticks = (staggered_sampling ? 5 : 2) * ticks_per_us;
     const bool quiet = voltage.d == 0 && voltage.q == 0;

@@ -58,12 +58,19 @@ public:
     static constexpr int pwm_gpio[3] = {15, 16, 17};
     static constexpr int enable_gpio = 18;
     static constexpr uint32_t resolution = sampling_timing::resolution_hz, half_period = resolution / (2 * pwm_profile_hz);
-    static constexpr uint32_t pwm_hz = resolution / (2 * half_period), encoder_hz = 2500;
-    static constexpr bool staggered_sampling = pwm_hz == 20000;
-    static constexpr uint32_t sampling_phase_skew_us = staggered_sampling ? 50 : 0;
-    static constexpr uint32_t control_hz = CONFIG_KNOB_CONTROL_HZ, control_period_us = 1000000 / control_hz;
-    static_assert(control_hz == 2000 || control_hz == 5000);
-    static_assert(pwm_hz % control_hz == 0 && pwm_hz % encoder_hz == 0);
+    static constexpr uint32_t pwm_hz = resolution / (2 * half_period);
+    static constexpr bool staggered_sampling = pwm_profile_hz >= 15000;
+    // Keep scheduling in carrier counts: the 15 kHz profile's rounded timer
+    // period is not an integer divisor of either the clock or nominal rates.
+    static constexpr uint32_t control_divider = pwm_profile_hz == 15000 ? 4 : pwm_profile_hz / CONFIG_KNOB_CONTROL_HZ;
+    static constexpr uint32_t encoder_divider = pwm_profile_hz / 2500;
+    static constexpr float pwm_actual_hz = static_cast<float>(resolution) / (2 * half_period);
+    static constexpr float control_hz = pwm_actual_hz / control_divider, encoder_hz = pwm_actual_hz / encoder_divider;
+    static constexpr float sampling_phase_skew_us = staggered_sampling ? 2.0f * half_period / (resolution / 1000000) : 0;
+    static constexpr uint32_t control_period_us = (2 * half_period * control_divider + resolution / 1000000 - 1) / (resolution / 1000000);
+    static_assert(CONFIG_KNOB_CONTROL_HZ == 2000 || CONFIG_KNOB_CONTROL_HZ == 5000);
+    static_assert((pwm_profile_hz == 15000 || pwm_profile_hz % CONFIG_KNOB_CONTROL_HZ == 0) && pwm_profile_hz % 2500 == 0);
+    static_assert(!staggered_sampling || control_divider >= 4, "Staggered ADC burst needs three carriers and a spare carrier");
     static_assert(!pwm_sampling_window_constrained || (staggered_sampling &&
         static_cast<uint32_t>(half_period * (1 - pwm_profile_duty_ceiling) + .5f) >=
             sampling_timing::minimum_compare_ticks), "PWM duty exceeds the ADC acquisition envelope");

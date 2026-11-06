@@ -366,8 +366,10 @@ private:
             // energize the bridge or write NVS as a side effect of restoration.
             if (state.state != State::idle) return "idle_required";
             if (!valid_calibration(r.diagnostic_calibration)) return "invalid_calibration";
-            state.calibration = r.diagnostic_calibration;
-            state.calibration_quality = {};
+            if (!restore_calibration_with_quality(r.diagnostic_calibration,
+                    r.diagnostic_quality_present ? &r.diagnostic_quality : nullptr,
+                    encoder_config::calibration_id, state.config.sense_gain,
+                    state.calibration, state.calibration_quality)) return "calibration_quality_identity";
             return nullptr;
         case Op::diagnostic_hold:
             if (state.state != State::active || !state.current_valid || state.diagnostic.busy ||
@@ -383,6 +385,7 @@ private:
             if (xQueueSend(test_plans, &r.diagnostic, 0) != pdTRUE) return "diagnostic_busy";
             state.diagnostic = {}; state.diagnostic.busy = true; state.diagnostic.stage = 1;
             state.diagnostic.axis = r.diagnostic.axis;
+            state.diagnostic.electrical_offset = r.diagnostic.electrical_offset;
             test_started_ = 0; return nullptr;
         case Op::diagnostic_read:
             if (state.diagnostic.stage == 6) return "disable_before_trace_read";
@@ -393,7 +396,9 @@ private:
             test_plan_ = r.diagnostic; test_started_ = now; test_sampled_ = 0;
             test_origin_ = angle_.angle(); pulse_start_ = 0;
             test_electrical_ = wrap(state.calibration.direction * state.calibration.pole_pairs *
-                angle_.wrapped_angle() - state.calibration.electrical_zero);
+                angle_.wrapped_angle() - state.calibration.electrical_zero + test_plan_.electrical_offset);
+            state.diagnostic.electrical_offset = test_plan_.electrical_offset;
+            state.diagnostic.electrical_reference = test_electrical_;
             state.diagnostic.stage = 2; return nullptr;
         case Op::test_end:
             if (!r.test_command || energized()) return "disable_first";
@@ -923,7 +928,7 @@ private:
             state.encoder_age_us = encoder.timestamp_us ? std::max<int64_t>(0, now - encoder.timestamp_us) : 0;
             state.encoder_age_max_us = std::max(state.encoder_age_max_us, state.encoder_age_us);
             if (encoder.timestamp_us && encoder.timestamp_us != last_encoder_) {
-                const float encoder_dt = last_encoder_ ? (encoder.timestamp_us - last_encoder_) * 1e-6f : .0004f;
+                const float encoder_dt = last_encoder_ ? (encoder.timestamp_us - last_encoder_) * 1e-6f : 1.0f / Board::encoder_hz;
                 last_encoder_ = encoder.timestamp_us;
                 state.magnet = encoder.magnet;
                 if (encoder.error != ESP_OK) {

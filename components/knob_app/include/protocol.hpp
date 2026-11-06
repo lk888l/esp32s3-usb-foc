@@ -24,6 +24,8 @@ struct Request {
 #if CONFIG_KNOB_DIAGNOSTICS
     DiagnosticPlan diagnostic{};
     Calibration diagnostic_calibration{};
+    SavedCalibrationQuality diagnostic_quality{};
+    bool diagnostic_quality_present = false;
     int diagnostic_offset = 0;
     bool test_command = false;
 #endif

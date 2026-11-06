@@ -53,7 +53,9 @@ def latched_peak_duty(snapshot):
     # measured slots must agree, exactly as required by the HAL pair check.
     if not after[0] == before[1] == after[1]:
         return None
-    return max(1 - value / half_period for matrix in (before, after) for row in matrix[:2] for value in row)
+    # Only this carrier spans both useful measurements. before[0] can belong
+    # to an older command and must not inflate the claimed sampled endpoint.
+    return max(1 - value / half_period for value in after[0])
 
 
 def latched_duty_summary(samples):
@@ -125,7 +127,7 @@ def summarize(run):
 def run_check(args):
     report = {"passed": False, "runs": [], "cleanup_errors": [],
               "min_peak_duty": args.min_peak_duty,
-              "peak_duty_evidence": "snapshot_peak_duty is commanded; snapshot_peak_latched_duty uses valid drive ADC/current snapshots, first two slots' before/after compare values. Missing evidence is null; neither is an external waveform measurement",
+              "peak_duty_evidence": "snapshot_peak_duty is commanded; snapshot_peak_latched_duty uses valid drive ADC/current snapshots and the coherent after[0]==before[1]==after[1] carrier. Missing evidence is null; neither is an external waveform measurement",
               "purpose": "Fixed stator-frame d current / sampling window test; not a torque calibration"}
     device = original = calibration = None
     changed = False
@@ -158,8 +160,18 @@ def run_check(args):
                 run = {"requested_current": current, "drive_ms": drive_ms,
                        "before": device.request("status"), "samples": []}
                 report["runs"].append(run)
+                diagnostic_options = {}
+                if getattr(args, "stress_window", False):
+                    before = run["before"]
+                    cal = before["calibration"]
+                    angle = cal["direction"] * cal["pole_pairs"] * before["angle"] - cal["electrical_zero"]
+                    sector = math.pi / 3
+                    offset = (sector - angle) % sector - sector / 2
+                    diagnostic_options["electrical_offset"] = offset
+                    run["electrical_offset"] = offset
                 run["started"] = device.request("diagnose", axis="d", mode=0, velocity=0,
-                                                current=current, drive_ms=drive_ms, observe_ms=500)
+                                                current=current, drive_ms=drive_ms, observe_ms=500,
+                                                **diagnostic_options)
                 deadline = time.monotonic() + seconds + 5
                 next_log = time.monotonic() + 5
                 while True:
@@ -169,6 +181,10 @@ def run_check(args):
                     require(s["calibration"] == calibration, "Calibration changed during test")
                     require(s["diagnostic"].get("axis") == "d", "Firmware did not select d-axis injection")
                     require(s["diagnostic"].get("reference") == "fixed_start_angle", "Expected stationary test reference")
+                    if diagnostic_options:
+                        require(math.isclose(s["diagnostic"].get("electrical_offset", math.nan),
+                                             run["electrical_offset"], abs_tol=1e-6),
+                                "Firmware did not accept the requested electrical offset")
                     require(math.isclose(s["effective_voltage_limit"],
                                          s["bus_voltage"] * s["pwm_duty_ceiling"] / math.sqrt(3),
                                          rel_tol=1e-5), "PI voltage capacity does not match PWM ceiling")
@@ -282,6 +298,8 @@ def main():
                         help="Minimum effective control rate; defaults to 98%% of device control_nominal_hz")
     parser.add_argument("--min-peak-duty", type=float,
                         help="Require valid drive ADC/current snapshots to prove at least this latched duty (0, 1]; no command/lifetime fallback")
+    parser.add_argument("--stress-window", action="store_true",
+                        help="Aim the fixed d vector near the nearest 30+60n electrical degrees, within +/-30 degrees; requires offset-capable diagnostic firmware")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     try:

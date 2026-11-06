@@ -146,6 +146,14 @@ int main() {
     assert(adc_staggered_timing_valid(50, 100, 107));
     assert(!adc_staggered_timing_valid(100, 150, 157));
     assert(!adc_staggered_timing_valid(50, 100, 120));
+    // The 15 kHz floor uses 2666 half ticks: 66.65 us per carrier, so
+    // sequential integer timestamps may differ by either 66 or 67 us.
+    assert(adc_staggered_timing_valid(66, 133, 141, 5332));
+    assert(adc_staggered_timing_valid(67, 134, 142, 5332));
+    assert(!adc_staggered_timing_valid(50, 100, 107, 5332));
+    assert(!adc_staggered_timing_valid(133, 200, 207, 5332));
+    assert(!adc_staggered_timing_valid(67, 134, 154, 5332));
+    assert(!adc_staggered_timing_valid(67, 134, 130, 5332));
     uint16_t before[3][3] = {{600, 900, 1920}, {600, 900, 1920}, {700, 1000, 1920}};
     uint16_t after[3][3] = {{600, 900, 1920}, {600, 900, 1920}, {800, 1100, 1920}};
     assert(pwm_adc_pair_coherent(before, after));
@@ -206,6 +214,8 @@ int main() {
     assert(pwm_staggered_latch_delay_ticks(960, 2000, true) == 7040); // +12 -> +100 us
     assert(pwm_staggered_latch_delay_ticks(3200, 2000, true) == 4800); // +40 -> +100 us
     assert(pwm_staggered_latch_delay_ticks(960, 2000, false) == 3040); // normal +12 -> +50 us
+    assert(pwm_staggered_latch_delay_ticks(960, 2666, false) == 4372); // +12 -> +66.65 us
+    assert(pwm_staggered_latch_delay_ticks(960, 2666, true) == 9704); // +12 -> +133.30 us
     // Stage 2's START is at most 2.25 us before TEZ. Although it releases pair
     // ownership, the 5 us commit guard permits the direct path only after TEZ.
     assert(!pwm_schedule_still_valid(5, 5, false, false, 3820, 3830, 4000, 400, 1, 50));

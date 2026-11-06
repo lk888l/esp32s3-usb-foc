@@ -34,16 +34,19 @@ struct DiagnosticPlan {
     float velocity = 50, current = .15f;
     int drive_us = 300000, observe_us = 2000000;
     DiagnosticAxis axis = DiagnosticAxis::q;
+    float electrical_offset = 0;
 };
 inline bool valid_diagnostic_plan(const DiagnosticPlan& plan, float current_limit) {
     if (static_cast<int>(plan.mode) < 0 || static_cast<int>(plan.mode) > 3 ||
         !std::isfinite(plan.current) || !std::isfinite(plan.velocity) ||
+        !std::isfinite(plan.electrical_offset) || std::abs(plan.electrical_offset) > pi / 6 ||
         !std::isfinite(current_limit)) return false;
     if (plan.axis == DiagnosticAxis::d)
         return plan.velocity == 0 && plan.current >= .05f && plan.current <= 3.0f && plan.current <= current_limit &&
             plan.drive_us >= 50000 && plan.drive_us <= 30000000 &&
             plan.observe_us >= 100000 && plan.observe_us <= 1000000;
-    return plan.axis == DiagnosticAxis::q && plan.current >= .02f && plan.current <= .25f &&
+    return plan.axis == DiagnosticAxis::q && plan.electrical_offset == 0 &&
+        plan.current >= .02f && plan.current <= .25f &&
         std::abs(plan.velocity) >= 10 && std::abs(plan.velocity) <= 60 &&
         plan.drive_us >= 50000 && plan.drive_us <= 500000 &&
         plan.observe_us >= 500000 && plan.observe_us <= 3000000;
@@ -92,5 +95,6 @@ struct DiagnosticSummary {
     int count = 0;
     uint32_t muted_samples = 0;
     float peak_speed = 0, peak_current = 0;
+    float electrical_offset = 0, electrical_reference = 0;
 };
 }

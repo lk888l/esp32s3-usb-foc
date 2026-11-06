@@ -105,6 +105,63 @@ const char* decode_request(const char* line, Request& r) {
             return fail("invalid_calibration");
         r.diagnostic_calibration = {true, direction->valueint, poles->valueint, static_cast<float>(zero->valuedouble)};
         if (!valid_calibration(r.diagnostic_calibration)) return fail("invalid_calibration");
+        r.diagnostic_quality_present = false;
+        r.diagnostic_quality = {};
+        if (const auto* quality = cJSON_GetObjectItemCaseSensitive(root, "calibration_quality")) {
+            if (!cJSON_IsObject(quality)) return fail("invalid_calibration_quality");
+            const auto* method = cJSON_GetObjectItemCaseSensitive(quality, "method");
+            const auto* verified = cJSON_GetObjectItemCaseSensitive(quality, "verified");
+            const auto* phase_check = cJSON_GetObjectItemCaseSensitive(quality, "phase_check_passed");
+            const auto* gain = cJSON_GetObjectItemCaseSensitive(root, "sense_gain");
+            if (!cJSON_IsString(method) || std::strcmp(method->valuestring, "bidirectional_v1") ||
+                !cJSON_IsTrue(verified) || !cJSON_IsTrue(phase_check) ||
+                !cJSON_IsNumber(gain) || !std::isfinite(gain->valuedouble))
+                return fail("invalid_calibration_quality");
+            auto& saved = r.diagnostic_quality;
+            saved.calibration = r.diagnostic_calibration;
+            saved.encoder_id = encoder_config::calibration_id;
+            saved.sense_gain = static_cast<float>(gain->valuedouble);
+            auto& q = saved.quality;
+            q.method = calibration_quality_method;
+            q.phase_check_passed = true;
+            struct QualityNumber { const char* name; float CalibrationQuality::*member; };
+            constexpr QualityNumber numbers[] = {{"current", &CalibrationQuality::current},
+                {"voltage_limit", &CalibrationQuality::voltage_limit}, {"pole_pairs", &CalibrationQuality::measured_pole_pairs},
+                {"forward_pole_pairs", &CalibrationQuality::forward_pole_pairs}, {"reverse_pole_pairs", &CalibrationQuality::reverse_pole_pairs},
+                {"direction_difference", &CalibrationQuality::direction_difference}, {"hysteresis_max", &CalibrationQuality::hysteresis_max},
+                {"residual_rms", &CalibrationQuality::residual_rms}, {"residual_max", &CalibrationQuality::residual_max},
+                {"verification_max", &CalibrationQuality::verification_max}};
+            for (const auto field : numbers) {
+                const auto* item = cJSON_GetObjectItemCaseSensitive(quality, field.name);
+                if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble)) return fail("invalid_calibration_quality");
+                q.*(field.member) = static_cast<float>(item->valuedouble);
+            }
+            struct QualityCount { const char* name; uint32_t CalibrationQuality::*member; };
+            constexpr QualityCount counts[] = {{"forward_points", &CalibrationQuality::forward_points},
+                {"reverse_points", &CalibrationQuality::reverse_points}, {"verification_points", &CalibrationQuality::verification_points}};
+            for (const auto field : counts) {
+                const auto* item = cJSON_GetObjectItemCaseSensitive(quality, field.name);
+                if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble) ||
+                    item->valuedouble < 0 || item->valuedouble > UINT32_MAX ||
+                    std::floor(item->valuedouble) != item->valuedouble) return fail("invalid_calibration_quality");
+                q.*(field.member) = static_cast<uint32_t>(item->valuedouble);
+            }
+            struct QualityArray { const char* name; std::array<float, 3> CalibrationQuality::*member; };
+            constexpr QualityArray arrays[] = {{"offset_noise_a", &CalibrationQuality::noise_a},
+                {"offset_sem_a", &CalibrationQuality::sem_a}, {"offset_drift_a", &CalibrationQuality::drift_a}};
+            for (const auto field : arrays) {
+                const auto* values = cJSON_GetObjectItemCaseSensitive(quality, field.name);
+                if (!cJSON_IsArray(values) || cJSON_GetArraySize(values) != 3) return fail("invalid_calibration_quality");
+                for (int phase = 0; phase < 3; ++phase) {
+                    const auto* item = cJSON_GetArrayItem(values, phase);
+                    if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble)) return fail("invalid_calibration_quality");
+                    (q.*(field.member))[phase] = static_cast<float>(item->valuedouble);
+                }
+            }
+            if (!quality_matches(saved, r.diagnostic_calibration, encoder_config::calibration_id, saved.sense_gain))
+                return fail("invalid_calibration_quality");
+            r.diagnostic_quality_present = true;
+        }
     }
     if (r.op == Op::diagnostic_hold) {
         const auto* current = cJSON_GetObjectItemCaseSensitive(root, "current");
@@ -119,6 +176,13 @@ const char* decode_request(const char* line, Request& r) {
             (std::strcmp(axis->valuestring, "d") && std::strcmp(axis->valuestring, "q"))))
             return fail("diagnostic_axis");
         const bool d_axis = axis && !std::strcmp(axis->valuestring, "d");
+        float electrical_offset = 0;
+        if (const auto* offset = cJSON_GetObjectItemCaseSensitive(root, "electrical_offset")) {
+            if (!cJSON_IsNumber(offset) || !std::isfinite(offset->valuedouble) ||
+                std::abs(offset->valuedouble) > pi / 6 || (!d_axis && offset->valuedouble != 0))
+                return fail("diagnostic_electrical_offset");
+            electrical_offset = static_cast<float>(offset->valuedouble);
+        }
         const char* keys[] = {"mode", "velocity", "current", "drive_ms", "observe_ms"};
         double values[5]{};
         for (int i = 0; i < 5; ++i) {
@@ -136,7 +200,7 @@ const char* decode_request(const char* line, Request& r) {
             return fail("diagnostic_range");
         r.diagnostic = {static_cast<Mode>(static_cast<int>(values[0])), static_cast<float>(values[1]),
             static_cast<float>(values[2]), static_cast<int>(values[3] * 1000), static_cast<int>(values[4] * 1000),
-            d_axis ? DiagnosticAxis::d : DiagnosticAxis::q};
+            d_axis ? DiagnosticAxis::d : DiagnosticAxis::q, electrical_offset};
     }
     if (r.op == Op::diagnostic_read) {
         const auto* item = cJSON_GetObjectItemCaseSensitive(root, "offset");
@@ -177,8 +241,12 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "protocol", 1);
     cJSON_AddNumberToObject(root, "control_stack_free", s.control_stack_free);
     cJSON_AddNumberToObject(root, "console_stack_free", uxTaskGetStackHighWaterMark(nullptr));
-    cJSON_AddStringToObject(root, "firmware", "dma-v19-bidirectional-calibration");
+    cJSON_AddStringToObject(root, "firmware", "dma-v20-15k-sampling");
     cJSON_AddStringToObject(root, "pwm_profile", pwm_profile_name);
+    cJSON_AddNumberToObject(root, "adc_controller_hz", sampling_timing::adc_controller_hz);
+    cJSON_AddNumberToObject(root, "adc_sar_hz", sampling_timing::adc_sar_hz);
+    cJSON_AddNumberToObject(root, "adc_start_target_tick", sampling_timing::start_tick);
+    cJSON_AddNumberToObject(root, "adc_minimum_compare_ticks", sampling_timing::minimum_compare_ticks);
     const auto* app = esp_app_get_description();
     char app_sha256[65]{};
     constexpr char hex[] = "0123456789abcdef";
@@ -222,6 +290,9 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "control_nominal_hz", Board::control_hz);
     cJSON_AddNumberToObject(root, "encoder_nominal_hz", Board::encoder_hz);
     cJSON_AddNumberToObject(root, "pwm_hz", Board::pwm_hz);
+    cJSON_AddNumberToObject(root, "pwm_actual_hz", Board::pwm_actual_hz);
+    cJSON_AddNumberToObject(root, "control_carrier_divider", Board::control_divider);
+    cJSON_AddNumberToObject(root, "encoder_carrier_divider", Board::encoder_divider);
     cJSON_AddNumberToObject(root, "pwm_half_period_ticks", Board::half_period);
     cJSON_AddNumberToObject(root, "pwm_resolution_hz", Board::resolution);
     cJSON_AddNumberToObject(root, "pwm_duty_floor", pwm_zero_clamp ? 0 : duty_floor);
@@ -311,6 +382,8 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(diagnostic, "count", s.diagnostic.count);
     cJSON_AddNumberToObject(diagnostic, "peak_speed", s.diagnostic.peak_speed);
     cJSON_AddNumberToObject(diagnostic, "peak_current", s.diagnostic.peak_current);
+    cJSON_AddNumberToObject(diagnostic, "electrical_offset", s.diagnostic.electrical_offset);
+    cJSON_AddNumberToObject(diagnostic, "electrical_reference", s.diagnostic.electrical_reference);
     cJSON_AddNumberToObject(diagnostic, "muted_samples", s.diagnostic.muted_samples);
     cJSON_AddBoolToObject(diagnostic, "recovered", s.diagnostic.recovered);
     if (r.diagnostic_count) {

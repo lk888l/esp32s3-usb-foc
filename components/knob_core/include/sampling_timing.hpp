@@ -1,5 +1,8 @@
 #pragma once
 #include <cstdint>
+#ifdef ESP_PLATFORM
+#include "sdkconfig.h"
+#endif
 
 namespace knob::sampling_timing {
 // All timing values use the same 80 MHz MCPWM clock as the HAL. The settling
@@ -14,7 +17,13 @@ constexpr uint32_t resolution_hz = 80'000'000;
 // uses CLKM=7/SAR=1: 10 MHz digital control, 5 MHz analog conversion. ADC2's
 // independent RTC oneshot clock is unaffected.
 constexpr uint32_t adc_apb_hz = 80'000'000;
+#if defined(CONFIG_KNOB_ADC_FAST_TIMING) && CONFIG_KNOB_ADC_FAST_TIMING
+// Speed up only the digital controller; the analog SAR remains at 5 MHz.
+// The faster controller reduces START synchronization overhead.
+constexpr uint32_t adc_controller_divider = 1, adc_sar_divider = 7;
+#else
 constexpr uint32_t adc_controller_divider = 7, adc_sar_divider = 1;
+#endif
 constexpr uint32_t adc_controller_hz = adc_apb_hz / (adc_controller_divider + 1);
 constexpr uint32_t adc_sar_hz = adc_controller_hz / (adc_sar_divider + 1);
 constexpr uint32_t adc_conversion_clocks = 25;
@@ -23,9 +32,20 @@ static_assert(adc_apb_hz % (adc_controller_divider + 1) == 0 &&
     adc_controller_hz % (adc_sar_divider + 1) == 0);
 constexpr uint32_t settling_ticks = 480;        // 6 us after the falling edge
 constexpr uint32_t rising_guard_ticks = 80;    // 1 us before the rising edge
+#if defined(CONFIG_KNOB_ADC_FAST_TIMING) && CONFIG_KNOB_ADC_FAST_TIMING
+constexpr int start_tick = -80;               // START no earlier than -1 us
+constexpr uint32_t completion_budget_tick = 488; // ADC1_DONE: +6.1 us
+#ifdef CONFIG_KNOB_ADC_RESERVE_TICKS
+constexpr uint32_t reserve_ticks = CONFIG_KNOB_ADC_RESERVE_TICKS;
+#else
+constexpr uint32_t reserve_ticks = 31;         // 0.3875 us beyond strict bounds
+#endif
+static_assert(reserve_ticks <= 80, "ADC acquisition reserve must be 0..80 ticks");
+#else
 constexpr int start_tick = -180;              // START no earlier than -2.25 us
 constexpr uint32_t completion_budget_tick = 560; // ADC1_DONE observation: +7 us
 constexpr uint32_t reserve_ticks = 40;         // another 0.5 us on both bounds
+#endif
 
 // Around TEZ, the low-side interval is [-falling_compare, +rising_compare].
 // Derive a modulation limit that can contain the entire acquisition envelope.
@@ -38,5 +58,11 @@ constexpr float duty_ceiling(uint32_t half_period_ticks) {
     return half_period_ticks > minimum_compare_ticks
         ? static_cast<float>(half_period_ticks - minimum_compare_ticks) / half_period_ticks : 0.0f;
 }
-static_assert(start_tick < 0 && minimum_compare_ticks == 700);
+static_assert(start_tick < 0);
+#if defined(CONFIG_KNOB_ADC_FAST_TIMING) && CONFIG_KNOB_ADC_FAST_TIMING
+static_assert(falling_requirement == 560 && rising_requirement == 569);
+static_assert(minimum_compare_ticks == 569 + reserve_ticks);
+#else
+static_assert(minimum_compare_ticks == 700);
+#endif
 }

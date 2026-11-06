@@ -30,6 +30,24 @@ int main() {
     plan.observe_us = 1000001;
     assert(!valid_diagnostic_plan(plan, 3));
     plan = {Mode::free, 0, 3, 300000, 500000, DiagnosticAxis::d};
+    assert(plan.electrical_offset == 0);
+    auto offset_plan = plan;
+    for (float offset : {pi / 6, -pi / 6}) {
+        offset_plan.electrical_offset = offset;
+        assert(valid_diagnostic_plan(offset_plan, 3));
+        // Changing the diagnostic frame cannot relax motion or deadlines.
+        assert(diagnostic_d_action(offset_plan, 100, .1501f, 0) == DiagnosticDAction::motion_fault);
+        assert(diagnostic_d_action(offset_plan, 100, 0, 5.01f) == DiagnosticDAction::motion_fault);
+        assert(diagnostic_d_action(offset_plan, 800000, 0, 0) == DiagnosticDAction::complete);
+        assert(diagnostic_d_target(offset_plan, 100000) == diagnostic_d_target(plan, 100000));
+    }
+    for (float offset : {std::nextafter(pi / 6, std::numeric_limits<float>::infinity()),
+                         std::nextafter(-pi / 6, -std::numeric_limits<float>::infinity()),
+                         std::numeric_limits<float>::quiet_NaN(),
+                         std::numeric_limits<float>::infinity()}) {
+        offset_plan.electrical_offset = offset;
+        assert(!valid_diagnostic_plan(offset_plan, 3));
+    }
 
     // A short run cannot bypass the fixed 200 ms smooth ramp. The requested
     // current is not a claim that the plateau was reached before cutoff.
@@ -77,4 +95,11 @@ int main() {
     DiagnosticPlan legacy;
     assert(valid_diagnostic_plan(legacy, .08f)); // Existing q stimulus is still limited by the live current budget.
     assert(legacy.axis == DiagnosticAxis::q);
+    assert(legacy.electrical_offset == 0);
+    legacy.electrical_offset = .001f;
+    assert(!valid_diagnostic_plan(legacy, .08f));
+    legacy.electrical_offset = -.001f;
+    assert(!valid_diagnostic_plan(legacy, .08f));
+    legacy.electrical_offset = 0;
+    assert(valid_diagnostic_plan(legacy, .08f));
 }

@@ -10,7 +10,13 @@ namespace knob {
 // Explicit high-duty profiles remain available for controlled comparisons;
 // they do not guarantee a measurable low-side window for every phase pair.
 // Pulse-floor policy remains independent of that voltage ceiling.
-#if defined(CONFIG_KNOB_PWM_20K90) && CONFIG_KNOB_PWM_20K90
+#if defined(CONFIG_KNOB_PWM_15K_SAMPLING) && CONFIG_KNOB_PWM_15K_SAMPLING
+constexpr uint32_t pwm_profile_hz = 15000;
+constexpr float pwm_profile_duty_ceiling = sampling_timing::duty_ceiling(sampling_timing::resolution_hz / (2 * pwm_profile_hz));
+constexpr bool pwm_sampling_window_constrained = true;
+constexpr bool pwm_zero_clamp = true, pwm_zero_floor = true;
+constexpr const char* pwm_profile_name = "15k_sampling";
+#elif defined(CONFIG_KNOB_PWM_20K90) && CONFIG_KNOB_PWM_20K90
 constexpr uint32_t pwm_profile_hz = 20000;
 constexpr float pwm_profile_duty_ceiling = .90f;
 constexpr bool pwm_sampling_window_constrained = false;

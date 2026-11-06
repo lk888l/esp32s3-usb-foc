@@ -8,6 +8,39 @@ foreach(calibration_test IN ITEMS calibration_fit current_offsets calibration_se
     target_compile_options(${calibration_test}_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
     add_test(NAME ${calibration_test} COMMAND ${calibration_test}_tests)
 endforeach()
+
+foreach(fast_timing IN ITEMS 0 1)
+    add_executable(sampling_envelope_${fast_timing}_tests sampling_envelope_tests.cpp ../components/knob_core/src/control.cpp)
+    target_include_directories(sampling_envelope_${fast_timing}_tests PRIVATE ../components/knob_core/include ../components/knob_hal/include ../components/knob_app/include)
+    target_compile_definitions(sampling_envelope_${fast_timing}_tests PRIVATE CONFIG_KNOB_PWM_15K_SAMPLING=1 CONFIG_KNOB_ADC_FAST_TIMING=${fast_timing})
+    target_compile_options(sampling_envelope_${fast_timing}_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+    add_test(NAME sampling_envelope_${fast_timing} COMMAND sampling_envelope_${fast_timing}_tests)
+endforeach()
+
+add_executable(control_15k_fast_tests control_tests.cpp ../components/knob_core/src/control.cpp)
+target_include_directories(control_15k_fast_tests PRIVATE ../components/knob_core/include)
+target_compile_definitions(control_15k_fast_tests PRIVATE CONFIG_KNOB_PWM_15K_SAMPLING=1 CONFIG_KNOB_ADC_FAST_TIMING=1)
+target_compile_options(control_15k_fast_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME foc_voltage_15k_fast COMMAND control_15k_fast_tests)
+
+add_executable(sampling_envelope_zero_reserve_tests sampling_envelope_tests.cpp ../components/knob_core/src/control.cpp)
+target_include_directories(sampling_envelope_zero_reserve_tests PRIVATE ../components/knob_core/include ../components/knob_hal/include ../components/knob_app/include)
+target_compile_definitions(sampling_envelope_zero_reserve_tests PRIVATE CONFIG_KNOB_PWM_15K_SAMPLING=1 CONFIG_KNOB_ADC_FAST_TIMING=1 CONFIG_KNOB_ADC_RESERVE_TICKS=0)
+target_compile_options(sampling_envelope_zero_reserve_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME sampling_envelope_zero_reserve COMMAND sampling_envelope_zero_reserve_tests)
+
+add_executable(control_15k_zero_reserve_tests control_tests.cpp ../components/knob_core/src/control.cpp)
+target_include_directories(control_15k_zero_reserve_tests PRIVATE ../components/knob_core/include)
+target_compile_definitions(control_15k_zero_reserve_tests PRIVATE CONFIG_KNOB_PWM_15K_SAMPLING=1 CONFIG_KNOB_ADC_FAST_TIMING=1 CONFIG_KNOB_ADC_RESERVE_TICKS=0)
+target_compile_options(control_15k_zero_reserve_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME foc_voltage_15k_zero_reserve COMMAND control_15k_zero_reserve_tests)
+
+add_executable(sampling_envelope_selected_tests sampling_envelope_tests.cpp ../components/knob_core/src/control.cpp)
+target_include_directories(sampling_envelope_selected_tests PRIVATE ../components/knob_core/include ../components/knob_hal/include ../components/knob_app/include)
+target_compile_definitions(sampling_envelope_selected_tests PRIVATE CONFIG_KNOB_PWM_15K_SAMPLING=1 CONFIG_KNOB_ADC_FAST_TIMING=1 CONFIG_KNOB_ADC_RESERVE_TICKS=8)
+target_compile_options(sampling_envelope_selected_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME sampling_envelope_selected COMMAND sampling_envelope_selected_tests)
+
 add_executable(calibration_quality_tests calibration_quality_tests.cpp ../components/knob_core/src/control.cpp)
 target_include_directories(calibration_quality_tests PRIVATE ../components/knob_app/include ../components/knob_core/include ../components/knob_encoder/include)
 target_compile_options(calibration_quality_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
@@ -86,7 +119,7 @@ add_test(NAME control_feedback_interval COMMAND control_timing_tests)
 
 # Voltage capability and all-sector modulation must agree with each selectable
 # hardware profile, not merely the default host compilation.
-foreach(profile IN ITEMS 10K50 5K70 20K70 20K65 20K90 20K100)
+foreach(profile IN ITEMS 10K50 5K70 15K_SAMPLING 20K70 20K65 20K90 20K100)
     string(TOLOWER "${profile}" profile_suffix)
     add_executable(control_${profile_suffix}_tests control_tests.cpp ../components/knob_core/src/control.cpp)
     target_include_directories(control_${profile_suffix}_tests PRIVATE ../components/knob_core/include)

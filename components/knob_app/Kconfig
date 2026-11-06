@@ -13,7 +13,18 @@ config KNOB_CONSOLE_USB
 endchoice
 choice KNOB_PWM_PROFILE
     prompt "PWM and current sampling profile"
-    default KNOB_PWM_20K65
+    default KNOB_PWM_15K_SAMPLING
+config KNOB_PWM_15K_SAMPLING
+    bool "15 kHz minimum / ADC acquisition window reserved"
+    help
+        Uses 2666 timer ticks per half cycle at 80 MHz, producing 15003.75 Hz.
+        Maximum phase duty follows the shared ADC acquisition envelope; the
+        slow 700-tick envelope permits 73.743 percent; the default FAST
+        577-tick envelope permits 78.357 percent. All physical-window
+        and conversion-ownership checks remain active. Three conversions span
+        consecutive carriers, with one spare carrier per control period.
+        Control runs every four carriers (3750.94 Hz), encoder every six
+        carriers (2500.63 Hz). The two current phases are 66.65 us apart.
 config KNOB_PWM_20K90
     bool "20 kHz / 90 percent (experimental, insufficient sampling windows)"
     help
@@ -39,7 +50,7 @@ config KNOB_PWM_20K100
         current samples outside their phase windows are rejected and recovered
         without latching a sampling-window or control-period fault. High duty
         can cause repeated feedback recovery and interrupted torque. The
-        default 65 percent profile reserves the ADC acquisition window.
+        20 kHz / 65 percent profile reserves the original ADC acquisition window.
 config KNOB_PWM_10K50
     bool "10 kHz / 50 percent (existing same-window sampling)"
 config KNOB_PWM_5K70
@@ -53,9 +64,29 @@ config KNOB_PWM_20K70
         A phase may remain low while other active pulses stay at least 4%.
         This increases the low-side window at the same line-to-line voltage.
 endchoice
+config KNOB_ADC_FAST_TIMING
+    bool "15 kHz faster ADC controller timing"
+    depends on KNOB_PWM_15K_SAMPLING
+    default y
+    help
+        Keep the analog SAR clock at 5 MHz while running its digital controller
+        at 40 MHz. Use the separately defined acquisition envelope for this
+        candidate. Physical settling and rising-edge guards remain unchanged.
+config KNOB_ADC_RESERVE_TICKS
+    int "Extra ADC acquisition reserve (80 MHz timer ticks)"
+    depends on KNOB_ADC_FAST_TIMING
+    range 0 80
+    default 8
+    help
+        Extra margin beyond the 6 us falling-edge settling, planned START,
+        ADC1_DONE budget and strict 1 us rising-edge guard. The default 8 ticks
+        gives compare >= 577; 31 gives 600. Zero gives 569 for an upper-bound
+        comparison. Zero removes only this extra reserve; every actual sample
+        must still pass the unchanged physical-window and ownership checks.
 choice KNOB_CONTROL_RATE
     prompt "PWM-synchronous current/control rate"
     default KNOB_CONTROL_5KHZ
+    depends on !KNOB_PWM_15K_SAMPLING
 config KNOB_CONTROL_2KHZ
     bool "2 kHz (500 us; controlled comparison)"
     depends on KNOB_PWM_10K50
@@ -68,6 +99,7 @@ config KNOB_CONTROL_HZ
     default 5000
     help
         ADC bursts and the control task follow PWM events at this rate.
+        The 15 kHz profile instead uses four carrier cycles (3750.94 Hz).
         The sampling-window experiment uses 10 kHz PWM; encoder wake cadence stays
         at 2.5 kHz, so a rate comparison does not also change encoder timing.
 config KNOB_BUS_VOLTAGE_SENSE

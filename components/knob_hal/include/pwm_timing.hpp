@@ -70,7 +70,7 @@ constexpr bool pwm_adc_window_valid(int start_tick, int completion_tick,
         start_tick >= -static_cast<int>(falling_compare) + static_cast<int>(settling_ticks) &&
         completion_tick >= start_tick && completion_tick < static_cast<int>(rising_compare - guard_ticks);
 }
-// For the 20 kHz adapter, START is in [-2.25 us, TEZ). A fresh ADC1_DONE must
+// For the staggered adapter, START is in the configured pre-TEZ interval. A fresh ADC1_DONE must
 // belong to this carrier. Counter and wall-clock reads are not atomic; allow
 // five microseconds of read/metadata skew, independently of the physical PWM
 // edge guards, which continue to use only the coherent hardware counter.
@@ -123,9 +123,18 @@ constexpr bool adc_next_stage_ready(unsigned launched, unsigned received, unsign
         (completed_mask & (1U << (launched - 1))) != 0;
 }
 constexpr bool adc_staggered_timing_valid(uint32_t second_start_us, uint32_t third_start_us,
-        uint32_t completion_us) {
-    return second_start_us >= 45 && second_start_us <= 55 &&
-        third_start_us >= 95 && third_start_us <= 105 && completion_us < 120;
+        uint32_t completion_us, uint32_t carrier_ticks = 4000) {
+    // Compare in timer ticks so 15 kHz's 66.65 us carrier is not rounded to
+    // 66/67 us before accumulating the second interval. Timestamp skew is
+    // independent of the physical falling/rising edge checks.
+    constexpr uint32_t ticks_per_us = sampling_timing::resolution_hz / 1000000;
+    constexpr uint32_t skew = 5 * ticks_per_us;
+    const uint64_t second = static_cast<uint64_t>(second_start_us) * ticks_per_us;
+    const uint64_t third = static_cast<uint64_t>(third_start_us) * ticks_per_us;
+    return second + skew >= carrier_ticks && second <= carrier_ticks + skew &&
+        third + skew >= 2 * carrier_ticks && third <= 2 * carrier_ticks + skew &&
+        completion_us >= third_start_us &&
+        static_cast<uint64_t>(completion_us) * ticks_per_us < 2 * carrier_ticks + 20 * ticks_per_us;
 }
 constexpr bool pwm_adc_pair_coherent(const uint16_t before[3][3], const uint16_t after[3][3]) {
     // The first TEZ may latch a new command while the measured phase remains

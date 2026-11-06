@@ -1,6 +1,7 @@
 #include "calibration_quality.hpp"
 #include <cassert>
 #include <cmath>
+#include <cstring>
 #include <iostream>
 #include <limits>
 
@@ -144,9 +145,70 @@ static void test_numerical_validation() {
     saved = verified(); saved.quality.residual_max = .01f; assert(!matches(saved)); // RMS cannot exceed maximum.
 }
 
+static void test_atomic_ram_restore() {
+    // Exact pre-flash user evidence from build/svpwm15-20261106/before.json.
+    // This verifies preservation of an existing calibration, not a new fit.
+    SavedCalibrationQuality backup;
+    backup.calibration = {true, 1, 7, .288543552160263f};
+    backup.encoder_id = static_cast<uint32_t>(EncoderKind::mt6701);
+    backup.sense_gain = .15000000596046448f;
+    auto& q = backup.quality;
+    q.method = calibration_quality_method;
+    q.current = .239999994635582f; q.voltage_limit = 3;
+    q.forward_points = q.reverse_points = 29; q.verification_points = 6;
+    q.measured_pole_pairs = 6.996575355529785f;
+    q.forward_pole_pairs = 6.996093273162842f; q.reverse_pole_pairs = 6.9970574378967285f;
+    q.direction_difference = .07479169219732285f; q.hysteresis_max = .16830825805664062f;
+    q.residual_rms = .11295751482248306f; q.residual_max = .2624688446521759f;
+    q.verification_max = .0947279930114746f; q.phase_check_passed = true;
+    q.noise_a = {.0340266078710556f, .03346070647239685f, .03132075071334839f};
+    q.sem_a = {.001503777806647122f, .0014787683030590415f, .0013841947074979544f};
+    q.drift_a = {};
+    assert(valid_calibration_quality(q));
+    auto current = verified().calibration;
+    auto quality = verified().quality;
+    const auto refused = [&](const Calibration& requested, const SavedCalibrationQuality* evidence,
+                             uint32_t encoder_id, float gain) {
+        std::array<unsigned char, sizeof(Calibration)> calibration_bytes{};
+        std::array<unsigned char, sizeof(CalibrationQuality)> quality_bytes{};
+        std::memcpy(calibration_bytes.data(), &current, sizeof(current));
+        std::memcpy(quality_bytes.data(), &quality, sizeof(quality));
+        assert(!restore_calibration_with_quality(requested, evidence, encoder_id, gain, current, quality));
+        assert(std::memcmp(calibration_bytes.data(), &current, sizeof(current)) == 0);
+        assert(std::memcmp(quality_bytes.data(), &quality, sizeof(quality)) == 0);
+    };
+    auto bad = backup;
+    bad.sense_gain = .3f;
+    refused(backup.calibration, &bad, backup.encoder_id, backup.sense_gain);
+    refused(backup.calibration, &backup, backup.encoder_id, .3f);
+    refused(backup.calibration, &backup, static_cast<uint32_t>(EncoderKind::as5600), backup.sense_gain);
+    bad = backup; bad.calibration.electrical_zero = std::nextafter(bad.calibration.electrical_zero, tau);
+    refused(backup.calibration, &bad, backup.encoder_id, backup.sense_gain);
+    bad = backup; bad.quality.verification_points = 5;
+    refused(backup.calibration, &bad, backup.encoder_id, backup.sense_gain);
+    bad = backup; bad.quality.noise_a[1] = std::numeric_limits<float>::quiet_NaN();
+    refused(backup.calibration, &bad, backup.encoder_id, backup.sense_gain);
+    auto invalid = backup.calibration; invalid.valid = false;
+    refused(invalid, nullptr, backup.encoder_id, backup.sense_gain);
+    assert(restore_calibration_with_quality(backup.calibration, &backup,
+        backup.encoder_id, backup.sense_gain, current, quality));
+    assert(current.electrical_zero == backup.calibration.electrical_zero && current.direction == 1);
+    assert(quality.current == q.current && quality.noise_a == q.noise_a && quality.sem_a == q.sem_a);
+    assert(quality.residual_max == q.residual_max && quality.verification_max == q.verification_max);
+    assert(quality_matches({current, backup.encoder_id, backup.sense_gain, quality},
+        current, backup.encoder_id, backup.sense_gain));
+    // Legacy callers may restore usable calibration without evidence; that
+    // path must explicitly clear the previous verified quality metadata.
+    assert(restore_calibration_with_quality(backup.calibration, nullptr,
+        backup.encoder_id, backup.sense_gain, current, quality));
+    assert(current.valid && current.electrical_zero == backup.calibration.electrical_zero);
+    assert(quality.method == 0 && !valid_calibration_quality(quality));
+}
+
 int main() {
     test_identity_binding();
     test_method_and_complete_evidence();
     test_numerical_validation();
+    test_atomic_ram_restore();
     std::cout << "Calibration quality identity and validation tests passed\n";
 }

@@ -1,6 +1,16 @@
 # SmartKnob USB 协议 v1
 
-当前固件为 **`dma-v19-bidirectional-calibration`**，协议仍为 v1，沿用 `20k65_sampling`、20 kHz PWM 和 5 kHz 控制。2026-11-05 的 5 kHz / 90% 与 10 kHz / 85% 占空比实验已按用户要求回滚，详见[实验与最终恢复记录](duty90-20261105.md)。采样检查工具按设备 `control_nominal_hz` 的 98% 设置默认有效频率门槛，并验证实际锁存 duty；失败后停止后续电流阶梯。
+当前固件为 **`dma-v20-15k-sampling`**，协议仍为 v1，默认 `15k_sampling`、15003.75 Hz PWM、3750.94 Hz 控制，以及 `0.7835709 × Vbus / √3` 电压圆。采样检查工具按设备 `control_nominal_hz` 的 98% 设置默认有效频率门槛，并验证同一载波的实际锁存 duty；失败后停止后续电流阶梯。候选比较及验证范围见[15 kHz 测试记录](svpwm-15k-20261106.md)。
+
+## v20 载波、采样与诊断补充
+
+`pwm_hz` 保留向下取整的整数兼容字段；`pwm_actual_hz` 给计时器周期推导值。`control_carrier_divider=4`、`encoder_carrier_divider=6` 是实际调度分频，`control_nominal_hz`/`encoder_nominal_hz` 分别约 3750.94/2500.63 Hz；`current_phase_skew_us=66.65` 表示两次有用电流转换并不同时发生。
+
+`adc_controller_hz=40000000`、`adc_sar_hz=5000000`、`adc_start_target_tick=-80`、`adc_minimum_compare_ticks=577` 描述当前 FAST 时序。所有 ticks 使用 80 MHz 时钟，实际 START/DONE 和物理窗口验证仍逐样本执行；这些配置字段不保证每次中断都在预算内。
+
+诊断构建的 `diagnose` 新增可选 `electrical_offset`（rad，默认 0）。d 轴允许有限值且绝对值不超过 π/6；q 轴只允许 0，否则返回 `diagnostic_electrical_offset`。固件在驱动开始时捕获转子电角度并加偏置，此后固定参考。摘要返回 `electrical_offset` 和捕获到的 `electrical_reference`，原位移、速度、电流及截止时间保护保持有效。`--stress-window` 自动就近选取 30°+60°×n 方向，最终仍须通过锁存 compare 确认是否真正压到窗口端点。
+
+`diagnostic_restore_calibration` 可附带原状态中的 `calibration_quality` 和顶层 `sense_gain`。完整质量数据必须通过方法、数值及编码器/增益/校准身份检查，全部成功后在电机任务中同时恢复两项；任一失败保留旧状态。省略质量对象仍兼容旧行为：只恢复校准值，清空 verified 质量。该命令仅允许 idle，不使能输出、不写 NVS，用于恢复明确保存的烧录前 RAM 快照。
 
 ## 2026-11-06 v19：双向校准、质量记录与结果保留
 
