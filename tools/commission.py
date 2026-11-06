@@ -20,12 +20,49 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def calibrate_once(device, previous, attempt):
+    """Wait for the complete bidirectional sequence and its quality verdict."""
+    require(previous["state"] == "idle" and previous["fault"] == "none",
+            "Stop and clear faults before calibration")
+    require(previous.get("calibration_report", {}).get("method") == "bidirectional_v1",
+            "Bidirectional calibration firmware required")
+    attempt["previous"] = previous
+    attempt["samples"] = []
+    started = time.monotonic()
+    accepted = device.request("calibrate")
+    attempt["accepted"] = accepted
+    require(accepted["state"] in ("offsets", "align", "sweep", "settle") and
+            not accepted.get("calibration_report", {}).get("passed", True),
+            "Calibration did not start a fresh run")
+    while time.monotonic() - started < 130:
+        time.sleep(.04)
+        snapshot = device.request("status")
+        attempt["samples"].append(snapshot)
+        require(snapshot["fault"] == "none", snapshot["fault"])
+        require(snapshot["config"] == previous["config"], "Calibration changed configuration")
+        if snapshot["state"] == "idle":
+            quality = snapshot.get("calibration_report", {})
+            require(snapshot["calibration"]["valid"], "Calibration ended without a valid result")
+            require(quality.get("method") == "bidirectional_v1" and quality.get("passed") is True
+                    and not quality.get("cancelled", False), "Calibration quality checks did not pass")
+            require(quality.get("forward_points") == 29 and quality.get("reverse_points") == 29,
+                    "Calibration did not complete both scans")
+            require(snapshot["duty"] == [0, 0, 0], "Calibration left output energized")
+            attempt["elapsed_seconds"] = time.monotonic() - started
+            return snapshot
+        require(snapshot["state"] in ("offsets", "align", "sweep", "settle"),
+                "Unexpected calibration state")
+        require(snapshot["calibration"] == previous["calibration"],
+                "Unfinished calibration replaced the previous result")
+    raise TimeoutError("Calibration did not finish within the 130-second host deadline")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", default="/dev/ttyACM0")
     parser.add_argument("--output", type=Path, default=Path("build/commissioning/checks.json"))
     parser.add_argument("--calibration-cycles", type=int, default=0, choices=range(9),
-                        help="Repeat up to 8 electrical sweeps; 8 cover a full mechanical turn")
+                        help="Repeat up to 8 complete bidirectional calibrations (each scans a full mechanical turn both ways)")
     parser.add_argument("--max-current", type=float, default=.8,
                         help="Cap energized checks at this current in A (0.02–4.5; default: 0.8)")
     args = parser.parse_args()
@@ -58,21 +95,13 @@ def main():
     try:
         initial = device.request("status")
         report["calibration_runs"] = []
+        report["calibration_attempts"] = []
         for cycle in range(args.calibration_cycles):
-            require(initial["state"] == "idle", "Stop and clear faults before calibration")
-            device.request("calibrate")
-            deadline = time.monotonic() + 10
-            while time.monotonic() < deadline:
-                time.sleep(.04)
-                initial = device.request("status")
-                require(initial["state"] != "fault", initial["fault"])
-                if initial["state"] == "idle":
-                    require(initial["calibration"]["valid"], "Calibration ended without a valid result")
-                    report["calibration_runs"].append(initial)
-                    passed(f"calibration_sweep_{cycle + 1}")
-                    break
-            else:
-                raise TimeoutError("Calibration did not finish")
+            attempt = {"cycle": cycle + 1}
+            report["calibration_attempts"].append(attempt)
+            initial = calibrate_once(device, initial, attempt)
+            report["calibration_runs"].append(initial)
+            passed(f"calibration_sweep_{cycle + 1}")
             time.sleep(.15)
         require(initial["state"] == "idle" and initial["calibration"]["valid"], "Calibrate successfully first")
         original = dict(initial["config"])
@@ -85,7 +114,7 @@ def main():
         for mode in range(4):
             device.request("configure", {**test_config, "mode": mode})
             device.request("enable")
-            time.sleep(0.2)
+            device.wait_active()
             sample()
             rejected = reject("configure", "current_limit_range", {**test_config, "current_limit": invalid_limit})
             require(rejected["state"] == "active", "Rejected frame did not report real motor state")
@@ -104,7 +133,7 @@ def main():
             passed(f"mode_{mode}_enable_pulse_zero_live_config_disable")
         device.request("configure", test_config)
         device.request("enable")
-        time.sleep(0.2)
+        device.wait_active()
         sample()
         # Firmware may run standalone (lease=0), or enforce a configured lease.
         lease_ms = initial.get("host_lease_ms", 1000)
@@ -123,7 +152,7 @@ def main():
             device.request("disable")
             passed("standalone_operation_without_heartbeat")
         device.request("enable")
-        time.sleep(0.2)
+        device.wait_active()
         sample()
         # Invalid frames must not grant or extend permission to keep torque on.
         end = time.monotonic() + observation_s

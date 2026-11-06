@@ -110,7 +110,7 @@ def main():
             config = {**original, "mode": mode, "current_limit": args.max_current}
             device.request("configure", config)
             enable_when_ready(device, report, mode)
-            time.sleep(.25)
+            device.wait_active()
             for limit in (args.max_current, min(.2, args.max_current), args.max_current, .02, args.max_current):
                 config["current_limit"] = limit
                 ack = device.request("configure", config)
