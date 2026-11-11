@@ -5,7 +5,7 @@ import json
 import math
 import time
 from pathlib import Path
-from knobctl import Knob
+from knobctl import Knob, common_configuration
 
 def require(condition, message):
     if not condition:
@@ -30,7 +30,7 @@ def read_replies(device, ids):
                     replies[reply["id"]] = reply
             else:
                 line.append(byte)
-                require(len(line) <= 16384, "Oversize USB reply")
+                require(len(line) <= 32768, "Oversize USB reply")
     require(not pending, f"USB replies missing: {pending}")
     return replies
 
@@ -57,7 +57,7 @@ def main():
             require(math.isclose(initial["effective_voltage_limit"],
                                  initial["bus_voltage"] * initial["pwm_duty_ceiling"] / math.sqrt(3), rel_tol=1e-5),
                     "SVPWM capacity does not follow the live bus and duty ceiling")
-        refused = device.request("configure", {**initial["config"], "voltage_limit": .8}, allow_error=True)
+        refused = device.request("configure", {**common_configuration(initial["config"]), "voltage_limit": .8}, allow_error=True)
         require(not refused["ok"] and refused["error"] == "voltage_limit_automatic",
                 "Retired voltage field was not explicitly rejected")
         require(refused["config"] == initial["config"] and refused["calibration"] == initial["calibration"] and

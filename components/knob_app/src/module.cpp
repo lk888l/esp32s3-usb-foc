@@ -5,6 +5,7 @@
 #include "protocol.hpp"
 #include "encoder_mailbox.hpp"
 #include "encoder_config.hpp"
+#include "reference_modes.hpp"
 #include "sampling_recovery.hpp"
 #include "control_timing.hpp"
 #include "current_offsets.hpp"
@@ -133,7 +134,7 @@ private:
 };
 class Motor final : public AppTask {
 public:
-    Motor() : AppTask("knob_control", 6144, 20, 1) {}
+    Motor() : AppTask("knob_control", 9216, 20, 1) {}
     QueueHandle_t requests = nullptr, replies = nullptr;
 #if CONFIG_KNOB_DIAGNOSTICS
     QueueHandle_t test_plans = nullptr, test_requests = nullptr, test_replies = nullptr;
@@ -145,6 +146,8 @@ private:
     BusVoltageWorker bus_;
     AngleTracker angle_;
     Haptics haptic_;
+    ReferenceHaptics reference_haptic_;
+    Frictionless frictionless_;
     HapticSpeedLimiter haptic_speed_;
     CurrentLoop current_loop_;
     QuietOutput quiet_output_;
@@ -165,6 +168,7 @@ private:
     EncoderFreshness encoder_freshness_;
 #if CONFIG_KNOB_DIAGNOSTICS
     DiagnosticPlan test_plan_{};
+    Pi test_speed_pi_;
     DiagnosticHold torque_hold_{};
     std::array<DiagnosticSample, diagnostic_capacity> test_samples_{};
     int64_t test_started_ = 0, test_sampled_ = 0;
@@ -173,6 +177,21 @@ private:
     int capture_next_ = 0;
 #endif
     bool energized() const { return state.state != State::idle && state.state != State::fault; }
+    const ReferenceModeConfig& reference_config(Mode mode) const {
+        const int preset = static_cast<int>(mode) - reference_mode_first;
+        return preset >= 0 && preset < reference_config_count ? state.reference_modes[preset] : default_reference_config(0);
+    }
+    IRAM_ATTR void reset_frictionless() {
+        frictionless_.reset(); state.frictionless_phase = 0;
+        state.frictionless_reference = state.frictionless_correction = state.frictionless_feedforward = 0;
+    }
+    IRAM_ATTR void update_haptic_position() {
+        if (reference_mode(state.config.mode) && state.config.mode != Mode::frictionless) {
+            state.position = reference_haptic_.position(); state.sub_position = reference_haptic_.sub_position();
+        } else {
+            state.position = haptic_.position(); state.sub_position = haptic_.sub_position(state.config, angle_.angle());
+        }
+    }
     IRAM_ATTR void capture_fault_sample(const RawSample& raw, int interval_us, int64_t now) {
         state.fault_sample_interval_us = interval_us;
         state.fault_sample_age_us = now - raw.timestamp_us;
@@ -226,6 +245,7 @@ private:
         quiet_output_.reset(); state.quiet_output = false;
         state.current_limited = false; state.current_target_limit = 0;
         haptic_speed_.reset(); state.haptic_scale = 0;
+        reset_frictionless();
         state.speed_limited = false; state.haptic_paused = false;
         current_limiter_.reset(state.config.current_limit); trip_update_at_ = 0;
         current_trip_filter_.reset();
@@ -239,6 +259,7 @@ private:
         halt(fault);
     }
     IRAM_ATTR void zero_for_feedback_recovery() {
+        reset_frictionless();
         if (calibrating_ && state.state != State::offsets)
             calibration_sequence_.invalidate(Board::esp_time(), true);
         // Keep the driver enabled while waiting for trustworthy feedback.
@@ -253,8 +274,17 @@ private:
 #if CONFIG_KNOB_DIAGNOSTICS
     IRAM_ATTR void update_diagnostic_deadline(int64_t now) {
         auto& diagnostic = state.diagnostic;
-        if (!diagnostic.busy || diagnostic.axis != DiagnosticAxis::d || !test_started_ ||
+        if (!diagnostic.busy || !test_started_ ||
             state.state != State::active || diagnostic.stage < 2 || diagnostic.stage > 3) return;
+        if (diagnostic.axis == DiagnosticAxis::q) {
+            if (std::abs(angle_.velocity()) > 75) { fail("diagnostic_speed_guard"); return; }
+            const auto elapsed = now - test_started_;
+            if (elapsed >= int64_t(test_plan_.drive_us) + test_plan_.observe_us) {
+                diagnostic.stage = 4; halt(); return;
+            }
+            diagnostic.stage = elapsed < test_plan_.drive_us ? 2 : 3;
+            return;
+        }
         const auto action = diagnostic_d_action(test_plan_, now - test_started_,
             angle_.angle() - test_origin_, angle_.velocity());
         if (action == DiagnosticDAction::motion_fault) { fail("diagnostic_motion_guard"); return; }
@@ -391,6 +421,7 @@ private:
             if (!r.test_command || !state.diagnostic.busy || state.state != State::active) return "diagnostic_not_ready";
             if (!valid_diagnostic_plan(r.diagnostic, state.config.current_limit)) return "diagnostic_range_or_current_limit";
             test_plan_ = r.diagnostic; test_started_ = now; test_sampled_ = 0;
+            test_speed_pi_.reset();
             test_origin_ = angle_.angle(); pulse_start_ = 0;
             test_electrical_ = wrap(state.calibration.direction * state.calibration.pole_pairs *
                 angle_.wrapped_angle() - state.calibration.electrical_zero);
@@ -425,6 +456,17 @@ private:
         case Op::configure: {
             const auto& c = r.config;
             if (const char* e = validate(c)) return e;
+            if (r.frictionless_update)
+                if (const char* e = validate_frictionless(r.frictionless_config)) return e;
+            bool reference_changed = false;
+            for (int i = 0; i < reference_config_count; ++i) {
+                if (!(r.reference_update_mask & (1u << i))) continue;
+                if (const char* e = validate_reference_config(r.reference_modes[i], i)) return e;
+                reference_changed |= !same_reference_config(state.reference_modes[i], r.reference_modes[i]);
+            }
+            // Geometry, stored position and force changes are committed only
+            // while idle. A rejected patch cannot partially update any mode.
+            if (reference_changed && state.state != State::idle) return "disable_before_reference_config";
             const bool electrical = c.bus_voltage != state.config.bus_voltage || c.sense_gain != state.config.sense_gain ||
                 c.current_kp != state.config.current_kp || c.current_ki != state.config.current_ki;
             if (energized() && (electrical || state.state != State::active)) return "disable_before_electrical_config";
@@ -435,6 +477,16 @@ private:
                 state.calibration.valid = false; state.calibration_quality = {};
             }
             haptic_.reconfigure(state.config, c, angle_.angle());
+            for (int i = 0; i < reference_config_count; ++i)
+                if (r.reference_update_mask & (1u << i)) state.reference_modes[i] = r.reference_modes[i];
+            if (c.mode != state.config.mode || reference_changed) {
+                reference_haptic_.reset(angle_.angle(), static_cast<int>(c.mode) - 4, reference_config(c.mode));
+                reset_frictionless(); quiet_output_.reset(); current_loop_.reset();
+            }
+            if (r.frictionless_update) {
+                state.frictionless_config = r.frictionless_config;
+                reset_frictionless();
+            }
             state.config = c;
             update_bus_voltage(now);
             current_limiter_.configure(c.current_limit);
@@ -450,14 +502,15 @@ private:
                 state.current_trip_limit = trip; trip_update_at_ = 0;
                 if (state.state == State::active) board_.set_trip(state.offsets, c.sense_gain, trip);
             }
-            state.position = haptic_.position(); state.sub_position = haptic_.sub_position(c, angle_.angle());
+            update_haptic_position();
             if (electrical) { current_loop_.reset(); control_clock_.reset(); }
             pulse_start_ = 0; return nullptr;
         }
         case Op::zero:
             if (state.state != State::idle && state.state != State::active) return "busy";
             haptic_.reset(angle_.angle(), std::clamp(0, state.config.min_position, state.config.max_position));
-            state.position = haptic_.position(); state.sub_position = 0; return nullptr;
+            reference_haptic_.reset(angle_.angle(), static_cast<int>(state.config.mode) - 4, reference_config(state.config.mode));
+            reset_frictionless(); update_haptic_position(); state.sub_position = 0; return nullptr;
         case Op::pulse:
             if (state.state != State::active) return "enable_first";
             pulse_start_ = now; return nullptr;
@@ -532,7 +585,12 @@ private:
                 state.state = State::align; stage_start_ = now;
                 update_calibration_report(now);
             }
-            else { state.state = State::active; haptic_.reset(angle_.angle(), std::clamp(0,c.min_position,c.max_position)); }
+            else {
+                state.state = State::active;
+                haptic_.reset(angle_.angle(), std::clamp(0,c.min_position,c.max_position));
+                reference_haptic_.reset(angle_.angle(), static_cast<int>(c.mode) - 4, reference_config(c.mode));
+                reset_frictionless(); haptic_speed_.reset();
+            }
             return;
         }
         if (!energized()) return;
@@ -607,27 +665,47 @@ private:
                 zero_torque_intent = d_observing;
 #endif
             } else {
-                state.target = haptic_.step(c, output_angle_, angle_.haptic_velocity());
+                bool drive_override = false;
+#if CONFIG_KNOB_DIAGNOSTICS
+                drive_override = state.diagnostic.busy && state.diagnostic.stage == 2;
+#endif
+                if (c.mode == Mode::frictionless) {
+                    // Keep the familiar USB angle/count telemetry in free rotation.
+                    Config tracking = c; tracking.mode = Mode::free;
+                    haptic_.step(tracking, output_angle_, angle_.haptic_velocity());
+                    state.target = frictionless_.step(state.frictionless_config, angle_.haptic_velocity(), dt,
+                        std::min(c.current_limit, current_limiter_.capacity()), drive_override);
+                    state.frictionless_phase = frictionless_.phase();
+                    state.frictionless_reference = frictionless_.reference();
+                    state.frictionless_correction = frictionless_.correction();
+                    state.frictionless_feedforward = frictionless_.feedforward();
+                } else if (reference_mode(c.mode)) {
+                    state.target = reference_haptic_.step(static_cast<int>(c.mode) - 4,
+                        reference_config(c.mode), output_angle_, angle_.haptic_velocity(), dt, c.current_limit);
+                } else state.target = haptic_.step(c, output_angle_, angle_.haptic_velocity());
 #if CONFIG_KNOB_DIAGNOSTICS
                 if (torque_hold_.active()) state.target = torque_hold_.current();
 #endif
-                if (pulse_start_) {
+                if (pulse_start_ && c.mode != Mode::frictionless) {
                     const int64_t elapsed = now - pulse_start_;
                     if (elapsed < 6000) state.target += elapsed < 3000 ? 0.08f : -0.08f;
                     else pulse_start_ = 0;
                 }
                 zero_torque_intent = state.target == 0;
-                state.target = haptic_speed_.step(state.target, angle_.velocity(), c.current_limit, dt);
+                const float mode_limit = reference_mode(c.mode) && c.mode != Mode::frictionless ?
+                    std::min(c.current_limit, reference_current_limit) : c.current_limit;
+                state.target = haptic_speed_.step(state.target, angle_.velocity(), mode_limit, dt);
                 state.haptic_scale = haptic_speed_.scale();
                 state.speed_limited = haptic_speed_.limited(); state.haptic_paused = haptic_speed_.paused();
+                if (state.haptic_paused && c.mode == Mode::frictionless) reset_frictionless();
 #if CONFIG_KNOB_DIAGNOSTICS
                 if (state.diagnostic.busy && state.diagnostic.stage == 2) {
                     zero_torque_intent = false;
                     // Bounded external-motion stimulus. Haptics still track angle
                     // and speed, but the test current emulates a hand-driven spin.
                     const float ramp = std::min(1.0f, (now - test_started_) / 50000.0f);
-                    state.target = std::clamp(.015f * (test_plan_.velocity * ramp - angle_.velocity()),
-                                              -test_plan_.current, test_plan_.current);
+                    state.target = test_speed_pi_.step(test_plan_.velocity * ramp - angle_.velocity(),
+                        dt, .015f, .04f, std::min(test_plan_.current, c.current_limit));
                 }
 #endif
                 // Haptic torque uses sensor coordinates; electromagnetic torque uses electrical coordinates.
@@ -685,7 +763,9 @@ private:
         // integral then corrects model error/back-EMF instead of remembering a
         // several-millisecond detent pulse after the requested torque is zero.
         constexpr float resistance = CONFIG_KNOB_PHASE_RESISTANCE_MILLIOHM * .001f;
-        state.quiet_output = d_observing || quiet_output_.step(state.state == State::active && zero_torque_intent,
+        // FR-L tracks zero Iq even at rest; a zero-voltage short adds drag.
+        state.quiet_output = d_observing || quiet_output_.step(state.state == State::active &&
+                                                              c.mode != Mode::frictionless && zero_torque_intent,
                                                               angle_.velocity(), dt);
         Dq voltage{};
         if (state.quiet_output) current_loop_.reset();
@@ -719,12 +799,9 @@ private:
                 std::abs(state.target) <= 1e-5f) ++diagnostic.muted_samples;
             if (diagnostic.stage == 3 && diagnostic.muted_samples && !state.speed_limited)
                 diagnostic.recovered = true;
-            // Short drive tests isolate current ripple at the full control
-            // rate: <=250 drive samples plus <=1500 release samples fit here.
-            // Longer drive/release captures retain the 2 ms cadence.
-            const int capture_period_us = test_plan_.axis == DiagnosticAxis::d ?
-                diagnostic_capture_period_us(test_plan_) :
-                diagnostic.stage == 2 && test_plan_.drive_us <= 50000 ? 0 : 2000;
+            // Size capture cadence to the complete bounded run, including its
+            // release tail; long FR-L tests must not fill the buffer early.
+            const int capture_period_us = diagnostic_capture_period_us(test_plan_);
             if ((!test_sampled_ || now - test_sampled_ >= capture_period_us) && diagnostic.count < diagnostic_capacity) {
                 test_sampled_ = now;
                 test_samples_[diagnostic.count++] = {
@@ -735,7 +812,9 @@ private:
                                           ((raw.phase[0] | (raw.phase[1] << 2)) << 16)),
                     angle_.haptic_velocity(), state.voltage_d,
                     static_cast<uint16_t>(raw.raw[0]), static_cast<uint16_t>(raw.raw[1]),
-                    static_cast<int16_t>(raw.start_tick), static_cast<int16_t>(raw.end_tick), state.target_d};
+                    static_cast<int16_t>(raw.start_tick), static_cast<int16_t>(raw.end_tick), state.target_d,
+                    static_cast<float>(state.frictionless_phase), state.frictionless_reference,
+                    state.frictionless_correction, state.frictionless_feedforward};
             }
         }
         // Diagnostic builds keep the preceding ~410 ms at the full control
@@ -755,7 +834,9 @@ private:
                     ((raw.phase[0] | (raw.phase[1] << 2)) << 16)),
                 angle_.haptic_velocity(), state.voltage_d,
                 static_cast<uint16_t>(raw.raw[0]), static_cast<uint16_t>(raw.raw[1]),
-                static_cast<int16_t>(raw.start_tick), static_cast<int16_t>(raw.end_tick)};
+                static_cast<int16_t>(raw.start_tick), static_cast<int16_t>(raw.end_tick), state.target_d,
+                static_cast<float>(state.frictionless_phase), state.frictionless_reference,
+                state.frictionless_correction, state.frictionless_feedforward};
             capture_next_ = (capture_next_ + 1) % diagnostic_capacity;
             diagnostic.count = std::min(diagnostic_capacity, diagnostic.count + 1);
         }
@@ -836,6 +917,7 @@ private:
                 // Well-formed but refused commands cannot renew torque either.
                 if (!error && request.renew_lease) heartbeat_ = now;
                 Reply reply{error, state, request.id};
+                reply.reference_defaults = !error && request.op == Op::status && request.reference_defaults;
 #if CONFIG_KNOB_DIAGNOSTICS
                 if (!error && request.op == Op::diagnostic_read) {
                     reply.diagnostic_offset = request.diagnostic_offset;
@@ -1010,7 +1092,7 @@ private:
                 state.control_hz = metrics_cycles_ * 1000000.0f / (now - metrics_at_);
                 metrics_cycles_ = 0; metrics_at_ = now;
             }
-            state.position = haptic_.position(); state.sub_position = haptic_.sub_position(state.config, angle_.angle());
+            update_haptic_position();
             state.loop_us = Board::esp_time() - now;
         }
         board_.enable(false); encoder_.stop(); bus_.stop(); board_.shutdown();
@@ -1018,7 +1100,7 @@ private:
 };
 class Console final : public AppTask {
 public:
-    explicit Console(Motor& motor) : AppTask("knob_console", 16384, 5, 0), motor_(motor) {}
+    explicit Console(Motor& motor) : AppTask("knob_console", 24576, 5, 0), motor_(motor) {}
 private:
     Motor& motor_;
     bool transact(const Request& request, Reply& reply, int64_t deadline) {
@@ -1034,7 +1116,7 @@ private:
         return false;
     }
     void save_and_restart(const Request& request, Reply& reply) {
-        const bool saved = save_settings(reply.snapshot.config, reply.snapshot.calibration, reply.snapshot.calibration_quality);
+        const bool saved = save_settings(reply.snapshot.config, reply.snapshot.calibration, reply.snapshot.calibration_quality, reply.snapshot.frictionless_config, reply.snapshot.reference_modes);
         // An unsuccessful NVS write can also have suspended callbacks. Always
         // rebuild sampling after an attempted write, without clearing a fault.
         Request internal{};
@@ -1107,7 +1189,7 @@ private:
 // the control task; a separate request/reply pair cannot steal host replies.
 class DiagnosticTask final : public AppTask {
 public:
-    explicit DiagnosticTask(Motor& motor) : AppTask("knob_test", 8192, 4, 0), motor_(motor) {}
+    explicit DiagnosticTask(Motor& motor) : AppTask("knob_test", 12288, 4, 0), motor_(motor) {}
 private:
     Motor& motor_;
     int sequence_ = 0;
@@ -1182,7 +1264,7 @@ private:
     bool on_initialize() override {
         // Never erase unrelated NVS when recovery is needed.
         if (nvs_flash_init() != ESP_OK) return false;
-        load_settings(motor_.state.config, motor_.state.calibration, motor_.state.calibration_quality);
+        load_settings(motor_.state.config, motor_.state.calibration, motor_.state.calibration_quality, motor_.state.frictionless_config, motor_.state.reference_modes);
         motor_.requests = xQueueCreate(1, sizeof(Request)); motor_.replies = xQueueCreate(1, sizeof(Reply));
         if (!motor_.requests || !motor_.replies) return false;
 #if CONFIG_KNOB_DIAGNOSTICS

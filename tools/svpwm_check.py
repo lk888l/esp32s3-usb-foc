@@ -11,7 +11,7 @@ import math
 import time
 from pathlib import Path
 
-from knobctl import Knob
+from knobctl import Knob, common_configuration
 
 
 COUNTERS = ("pwm_full_duty_cycles", "timing_skips", "sampling_recoveries", "pwm_deferred")
@@ -82,7 +82,7 @@ def run_check(args):
         report["effective_max_current"] = maximum
         currents = sorted({round(min(current, maximum), 6) for current in (.08, .25, maximum)})
 
-        refused = device.request("configure", {**original, "voltage_limit": .8}, allow_error=True)
+        refused = device.request("configure", {**common_configuration(original), "voltage_limit": .8}, allow_error=True)
         report["retired_field_rejection"] = refused
         require(not refused["ok"] and refused["error"] == "voltage_limit_automatic",
                 "Retired voltage_limit field was not explicitly rejected")
@@ -99,7 +99,7 @@ def run_check(args):
             check_snapshot(run["before"], calibration)
             require(run["before"]["state"] == "idle", "Previous run did not stop")
             restore_needed = True  # A timeout may mean configure was accepted.
-            configured = device.request("configure", config)
+            configured = device.request("configure", common_configuration(config))
             check_snapshot(configured, calibration)
             # Compare subsequent restoration against the firmware's float32
             # roundtrip, rather than Python's original decimal request.
@@ -179,7 +179,7 @@ def run_check(args):
                         require(time.monotonic() < deadline, "Diagnostic cleanup did not finish")
                         time.sleep(.02)
                     if restore_needed:
-                        final = device.request("configure", original)
+                        final = device.request("configure", common_configuration(original))
                     final = device.request("status")
                     report["final"] = final
                     require(final["state"] in ("idle", "fault") and final["duty"] == [0, 0, 0],

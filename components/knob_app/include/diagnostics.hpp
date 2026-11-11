@@ -36,7 +36,7 @@ struct DiagnosticPlan {
     DiagnosticAxis axis = DiagnosticAxis::q;
 };
 inline bool valid_diagnostic_plan(const DiagnosticPlan& plan, float current_limit) {
-    if (static_cast<int>(plan.mode) < 0 || static_cast<int>(plan.mode) > 3 ||
+    if (static_cast<int>(plan.mode) < 0 || static_cast<int>(plan.mode) >= mode_count ||
         !std::isfinite(plan.current) || !std::isfinite(plan.velocity) ||
         !std::isfinite(current_limit)) return false;
     if (plan.axis == DiagnosticAxis::d)
@@ -44,9 +44,9 @@ inline bool valid_diagnostic_plan(const DiagnosticPlan& plan, float current_limi
             plan.drive_us >= 50000 && plan.drive_us <= 30000000 &&
             plan.observe_us >= 100000 && plan.observe_us <= 1000000;
     return plan.axis == DiagnosticAxis::q && plan.current >= .02f && plan.current <= .25f &&
-        std::abs(plan.velocity) >= 10 && std::abs(plan.velocity) <= 60 &&
-        plan.drive_us >= 50000 && plan.drive_us <= 500000 &&
-        plan.observe_us >= 500000 && plan.observe_us <= 3000000;
+        std::abs(plan.velocity) >= 1 && std::abs(plan.velocity) <= 60 &&
+        plan.drive_us >= 50000 && plan.drive_us <= 3000000 &&
+        plan.observe_us >= 500000 && plan.observe_us <= 10000000;
 }
 enum class DiagnosticDAction { drive, release, complete, motion_fault };
 // These deadlines and motion bounds have no dependency on ADC validity. The
@@ -84,6 +84,7 @@ struct DiagnosticSample {
     uint16_t adc_raw_a = 0, adc_raw_b = 0;
     int16_t sample_start_tick = 0, sample_end_tick = 0;
     float target_d = 0;
+    float hold_phase = 0, hold_reference = 0, hold_correction = 0, hold_feedforward = 0;
 };
 struct DiagnosticSummary {
     bool busy = false, cancelled = false, recovered = false;

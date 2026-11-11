@@ -1,5 +1,7 @@
 #pragma once
 #include "control.hpp"
+#include "frictionless.hpp"
+#include "reference_modes.hpp"
 #include "bus_voltage.hpp"
 #include "calibration_sequence.hpp"
 #include "calibration_quality.hpp"
@@ -20,6 +22,11 @@ enum class State { idle, offsets, align, sweep, settle, active, fault };
 const char* state_name(State state);
 struct Request {
     int id = 0; Op op = Op::status; Config config{}; bool renew_lease = true;
+    FrictionlessConfig frictionless_config{};
+    bool frictionless_update = false;
+    ReferenceModeBank reference_modes{};
+    uint16_t reference_update_mask = 0;
+    bool reference_defaults = false;
     CalibrationPlan calibration_plan{};
 #if CONFIG_KNOB_DIAGNOSTICS
     DiagnosticPlan diagnostic{};
@@ -43,6 +50,10 @@ struct CalibrationReport {
 };
 struct Snapshot {
     Config config{};
+    ReferenceModeBank reference_modes = default_reference_modes();
+    FrictionlessConfig frictionless_config{};
+    int frictionless_phase = 0;
+    float frictionless_reference = 0, frictionless_correction = 0, frictionless_feedforward = 0;
     Calibration calibration{};
     CalibrationQuality calibration_quality{};
     CalibrationReport calibration_report{};
@@ -124,6 +135,7 @@ struct Snapshot {
 };
 struct Reply {
     const char* error = nullptr; Snapshot snapshot{}; int request_id = -1;
+    bool reference_defaults = false;
 #if CONFIG_KNOB_DIAGNOSTICS
     std::array<DiagnosticSample, 4> diagnostic_samples{};
     int diagnostic_offset = 0, diagnostic_count = 0;
@@ -131,6 +143,6 @@ struct Reply {
 };
 const char* decode_request(const char* line, Request& request);
 cJSON* encode_reply(int id, const Reply& reply);
-bool load_settings(Config& config, Calibration& calibration, CalibrationQuality& quality);
-bool save_settings(const Config& config, const Calibration& calibration, const CalibrationQuality& quality);
+bool load_settings(Config& config, Calibration& calibration, CalibrationQuality& quality, FrictionlessConfig& frictionless, ReferenceModeBank& reference_modes);
+bool save_settings(const Config& config, const Calibration& calibration, const CalibrationQuality& quality, const FrictionlessConfig& frictionless, const ReferenceModeBank& reference_modes);
 }

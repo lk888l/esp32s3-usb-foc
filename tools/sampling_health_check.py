@@ -10,7 +10,7 @@ import math
 import time
 from pathlib import Path
 
-from knobctl import Knob
+from knobctl import Knob, common_configuration
 
 
 COUNTERS = ("control_cycles", "rejected_samples", "timing_skips", "adc_timing_skips",
@@ -72,6 +72,8 @@ def run_check(args):
     # Reserve a new report before touching the device; never replace evidence.
     with args.output.open("x", encoding="utf-8") as output:
         def request(op, config=None, **parameters):
+            if op == "configure" and config is not None:
+                config = common_configuration(config)
             allow_error = parameters.pop("allow_error", False)
             try:
                 reply = device.request(op, config, allow_error=True, **parameters)

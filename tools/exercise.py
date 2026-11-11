@@ -5,7 +5,7 @@ import json
 import time
 from pathlib import Path
 
-from knobctl import Knob
+from knobctl import Knob, common_configuration
 
 
 def main():
@@ -35,7 +35,7 @@ def main():
             value = getattr(args, key)
             if value is not None:
                 config[key] = value
-        device.request("configure", config)
+        device.request("configure", common_configuration(config))
         if args.wait_still:
             deadline = time.monotonic() + 25
             quiet_since = time.monotonic()
@@ -71,7 +71,7 @@ def main():
                 mode = min(3, int(elapsed * 4 / args.seconds)) if args.cycle_modes else args.mode
                 if mode != config["mode"]:
                     config["mode"] = mode
-                    device.request("configure", config)
+                    device.request("configure", common_configuration(config))
                     print(f"MODE: {mode}", flush=True)
                 sample = device.request("status")
                 sample["test_elapsed_s"] = time.monotonic() - started
@@ -104,7 +104,7 @@ def main():
                     path.write_text(json.dumps(trace, indent=2) + "\n")
                     print(f"TRACE: {len(trace['samples'])} samples -> {path}", flush=True)
                 if original is not None:
-                    device.request("configure", original)
+                    device.request("configure", common_configuration(original))
         finally:
             device.close()
 

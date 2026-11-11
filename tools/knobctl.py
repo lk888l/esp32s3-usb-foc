@@ -1,12 +1,26 @@
 #!/usr/bin/env python3
 """USB commissioning client. Requires pyserial; running commands always stop on exit."""
 import argparse
+import copy
 import json
 import math
 import sys
 import time
 from pathlib import Path
 import serial
+
+
+def common_configuration(config):
+    """Copy common/frictionless values without resending the per-mode bank.
+
+    Used only for operations that leave all reference parameters unchanged.
+    Omitting reference_modes preserves the device-owned bank and keeps the
+    request below the firmware's 2047-byte body limit. Explicit bank patches
+    supplied by a caller must instead be passed directly to request().
+    """
+    result = copy.deepcopy(config)
+    result.pop("reference_modes", None)
+    return result
 
 
 class Knob:
@@ -61,7 +75,7 @@ class Knob:
                     if not reply.get("ok") and not allow_error:
                         raise RuntimeError(reply.get("error", "Command rejected"))
                     return reply
-                elif len(line) >= 16384:
+                elif len(line) >= 32768:
                     overflow = True
                 elif not overflow:
                     line.append(byte)
@@ -104,6 +118,8 @@ def main():
     parser.add_argument("--calibration-max-current", type=float, help="Maximum calibration current in A")
     parser.add_argument("--calibration-voltage", type=float, help="Calibration voltage limit in V")
     parser.add_argument("--config", type=Path, help="Complete config JSON (for configure)")
+    parser.add_argument("--mode", type=int, choices=range(17),
+                        help="Select mode for configure/enable, preserving other settings (16: frictionless)")
     args = parser.parse_args()
     if not 0 < args.seconds <= 60:
         parser.error("--seconds must be in (0, 60]")
@@ -114,12 +130,20 @@ def main():
         ("voltage", args.calibration_voltage)) if value is not None}
     if calibration_parameters and args.op != "calibrate":
         parser.error("Calibration parameters require the calibrate operation")
-    if args.op == "configure" and args.config is None:
-        parser.error("configure requires --config")
+    if args.mode is not None and args.op not in ("configure", "enable"):
+        parser.error("--mode requires configure or enable")
+    if args.op == "configure" and args.config is None and args.mode is None:
+        parser.error("configure requires --config or --mode")
     device = Knob(args.port)
     try:
-        device.request("status")
+        initial = device.request("status")
         config = json.loads(args.config.read_text()) if args.config else None
+        if args.mode is not None:
+            config = common_configuration(initial["config"]) if config is None else config
+            config["mode"] = args.mode
+            if args.op == "enable":
+                device.request("configure", config)
+                config = None
         response = device.request(args.op, config, **calibration_parameters)
         print(json.dumps(response, ensure_ascii=False, indent=2))
         if args.op in ("calibrate", "enable"):

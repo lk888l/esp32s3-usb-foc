@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from knobctl import Knob
+from knobctl import Knob, common_configuration
 
 
 def require(condition, message):
@@ -77,6 +77,8 @@ def main():
         print(f"PASS: {name}", flush=True)
 
     def reject(op, expected, config=None):
+        if op == "configure" and config is not None:
+            config = common_configuration(config)
         reply = device.request(op, config, allow_error=True)
         require(not reply["ok"] and reply.get("error") == expected, f"Unexpected response to {op}")
         passed(expected)
@@ -112,7 +114,7 @@ def main():
         reject("configure", "current_limit_range", {**original, "current_limit": invalid_limit})
         require(device.request("status")["config"] == original, "Rejected config changed device settings")
         for mode in range(4):
-            device.request("configure", {**test_config, "mode": mode})
+            device.request("configure", {**common_configuration(test_config), "mode": mode})
             device.request("enable")
             device.wait_active()
             sample()
@@ -127,11 +129,11 @@ def main():
                 sample()
                 time.sleep(0.04)
             changed = {**test_config, "mode": mode, "strength": 0.6}
-            require(device.request("configure", changed)["state"] == "active", "Live haptic change stopped control")
+            require(device.request("configure", common_configuration(changed))["state"] == "active", "Live haptic change stopped control")
             sample()
             require(device.request("disable")["state"] == "idle", "Disable not acknowledged")
             passed(f"mode_{mode}_enable_pulse_zero_live_config_disable")
-        device.request("configure", test_config)
+        device.request("configure", common_configuration(test_config))
         device.request("enable")
         device.wait_active()
         sample()
@@ -166,7 +168,7 @@ def main():
             require(expired["state"] == "active" and expired["fault"] == "none", "Invalid frames changed standalone operation")
             device.request("disable")
             passed("invalid_frames_preserve_standalone_session")
-        device.request("configure", original)
+        device.request("configure", common_configuration(original))
         report["saved"] = device.request("save")
         passed("save_while_idle")
         report["passed"] = True
@@ -178,7 +180,7 @@ def main():
         try:
             device.request("disable")
             if original is not None:
-                device.request("configure", original)
+                device.request("configure", common_configuration(original))
             report["final"] = device.request("status")
         finally:
             device.close()
