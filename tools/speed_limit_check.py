@@ -8,7 +8,7 @@ import argparse
 import json
 import time
 from pathlib import Path
-from knobctl import Knob
+from knobctl import Knob, common_configuration
 
 
 def require(condition, message):
@@ -45,7 +45,7 @@ def main():
                 "Firmware does not report the speed envelope")
         original = initial["config"]
         if args.mode is not None:
-            device.request("configure", {**original, "mode": args.mode})
+            device.request("configure", {**common_configuration(original), "mode": args.mode})
         device.request("enable")
         deadline = time.monotonic() + 2
         while True:
@@ -107,7 +107,7 @@ def main():
             if device.identified:
                 device.request("disable")
                 if original is not None:
-                    device.request("configure", original)
+                    device.request("configure", common_configuration(original))
                 report["final"] = device.request("status")
         finally:
             try:

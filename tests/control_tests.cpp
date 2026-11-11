@@ -260,7 +260,11 @@ int main() {
     c = {}; c.sense_gain = .2f; assert(validate(c));
     c = {}; c.width = 0; assert(validate(c));
     c = {}; c.snap = .49f; assert(validate(c));
-    c = {}; c.mode = static_cast<Mode>(5); assert(validate(c));
+    for (int mode = 0; mode < mode_count; ++mode) {
+        c = {}; c.mode = static_cast<Mode>(mode); assert(!validate(c));
+    }
+    c = {}; c.mode = static_cast<Mode>(mode_count); assert(validate(c));
+    c.mode = static_cast<Mode>(-1); assert(validate(c));
     c = {}; c.current_kp = std::numeric_limits<float>::quiet_NaN(); assert(validate(c));
     c = {}; c.bus_voltage = 4.5; c.legacy_voltage_limit = 999; assert(validate(c) == nullptr);
     c = {}; c.min_position = 12; c.max_position = 11; assert(validate(c));

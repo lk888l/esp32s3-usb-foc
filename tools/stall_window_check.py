@@ -13,7 +13,7 @@ import statistics
 import time
 from pathlib import Path
 
-from knobctl import Knob
+from knobctl import Knob, common_configuration
 
 COUNTERS = ("control_cycles", "rejected_samples", "sampling_recoveries", "timing_skips",
             "encoder_timing_skips", "missed_samples", "pwm_deferred", "pwm_full_duty_cycles")
@@ -150,7 +150,7 @@ def run_check(args):
                     "Requested peak duty exceeds the firmware ceiling")
             original, calibration = initial["config"].copy(), initial["calibration"].copy()
             changed = True
-            report["configured"] = device.request("configure", {**original, "mode": 0, "damping": 0,
+            report["configured"] = device.request("configure", {**common_configuration(original), "mode": 0, "damping": 0,
                                                                   "current_limit": max(args.currents)})
             for index, current in enumerate(args.currents):
                 seconds = args.final_seconds if index == len(args.currents) - 1 else args.seconds
@@ -235,7 +235,7 @@ def run_check(args):
                         report["cleanup_errors"].append("Confirm stop: " + str(error))
                     if changed and stopped:
                         try:
-                            report["restored"] = device.request("configure", original)
+                            report["restored"] = device.request("configure", common_configuration(original))
                         except Exception as error:
                             report["cleanup_errors"].append("Restore: " + str(error))
                     try:

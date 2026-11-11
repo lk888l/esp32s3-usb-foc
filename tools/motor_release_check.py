@@ -11,7 +11,7 @@ from knobctl import Knob
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", default="/dev/ttyACM0")
-    parser.add_argument("--mode", type=int, choices=range(4), default=1)
+    parser.add_argument("--mode", type=int, choices=range(17), default=1)
     parser.add_argument("--velocity", type=float, default=50)
     parser.add_argument("--current", type=float, default=.15)
     parser.add_argument("--drive-ms", type=int, default=300)
@@ -30,7 +30,8 @@ def main():
     report = {"passed": False, "request": request, "samples": [],
               "columns": ["elapsed_us", "angle", "velocity", "target", "iq",
                           "id_current", "haptic_scale", "voltage_q", "phase_peak", "flags", "velocity_fast", "voltage_d",
-                          "adc_raw_a", "adc_raw_b", "sample_start_tick", "sample_end_tick"]}
+                          "adc_raw_a", "adc_raw_b", "sample_start_tick", "sample_end_tick",
+                          "hold_phase", "hold_reference", "hold_correction", "hold_feedforward"]}
     try:
         initial = device.request("status")
         report["initial"] = initial
@@ -39,7 +40,7 @@ def main():
         if "diagnostic" not in initial:
             raise RuntimeError("CONFIG_KNOB_DIAGNOSTICS build required")
         device.request("diagnose", **request)
-        deadline = time.monotonic() + 8
+        deadline = time.monotonic() + (args.drive_ms + args.observe_ms) / 1000 + 5
         previous_stage = -1
         while True:
             snapshot = device.request("status")

@@ -24,7 +24,7 @@ const char* validate(const Config& c)
     if (c.width < pi / 180 || c.width > pi || c.snap < 0.5f || c.snap > 1) return "detent_range";
     if (c.strength < 0 || c.strength > max_haptic_strength || c.endstop < 0 || c.endstop > 20 || c.damping < 0 || c.damping > 0.5f) return "haptic_range";
     if (c.min_position < -10000 || c.max_position > 10000 || c.min_position > c.max_position) return "position_range";
-    if (static_cast<int>(c.mode) < 0 || static_cast<int>(c.mode) > 3) return "mode_invalid";
+    if (static_cast<int>(c.mode) < 0 || static_cast<int>(c.mode) >= mode_count) return "mode_invalid";
     return nullptr;
 }
 bool valid_calibration(const Calibration& c) {
@@ -225,6 +225,21 @@ float HapticSpeedLimiter::step(float requested, float velocity, float limit, flo
     // Clamp before scaling so saturated endstops/springs also fade to zero.
     return std::clamp(requested, -limit, limit) * scale_;
 }
+float detent_current(float error, float velocity, float width, float strength, float damping) {
+    const float dead_zone = std::min(width * .2f, pi / 180);
+    const float input = -error + std::clamp(error, -dead_zone, dead_zone);
+    if (input == 0 && std::abs(velocity) <= .05f) return 0;
+    return strength * input - damping * velocity;
+}
+float limit_haptic_current(float requested, float velocity, float limit, bool elastic) {
+    float iq = std::clamp(requested, -limit, limit);
+    if (iq * velocity > 0) {
+        const float start = elastic ? 10.0f : detent_assist_fade_start;
+        const float stop = elastic ? 25.0f : detent_assist_cutoff;
+        iq *= std::clamp((stop - std::abs(velocity)) / (stop - start), 0.0f, 1.0f);
+    }
+    return iq;
+}
 float Haptics::step(const Config& c, float angle, float velocity) {
     if (!std::isfinite(angle) || !std::isfinite(velocity)) return 0;
     // Always track detents, even while the common speed limiter mutes torque.
@@ -250,28 +265,10 @@ float Haptics::step(const Config& c, float angle, float velocity) {
     if (c.mode == Mode::spring) iq -= c.strength * (angle - origin_);
     else if (endstop) iq -= c.endstop * error;
     else if (c.mode != Mode::free) {
-        // SmartKnob's restoring spring uses the SAME center as snap detection.
-        // Crossing snap moves that center by one pitch and flips the spring
-        // toward the next detent in this update. Do not wrap to the nearest
-        // pitch: that would reverse torque before the logical transition.
-        const float dead_zone = std::min(c.width * .2f, pi / 180);
-        const float input = -error + std::clamp(error, -dead_zone, dead_zone);
-        iq += c.strength * input;
-        // Match the reference's geometric idle gate, never a current-amplitude
-        // deadband. Even a tiny restoring request outside the zone survives.
-        if (input == 0 && std::abs(velocity) <= .05f) iq = 0;
+        iq = detent_current(error, velocity, c.width, c.strength, damping);
     }
-    iq = std::clamp(iq, -c.current_limit, c.current_limit);
-    // At fast crossings, current/encoder latency can turn a nominally
-    // conservative detent into a motor. Retain the resisting half, but taper
-    // positive work only above ordinary hand-turning speed. The same
-    // rule prevents a wound-up spring/endstop from repeatedly reaccelerating.
-    if (iq * velocity > 0) {
-        const bool elastic = c.mode == Mode::spring || endstop;
-        const float start = elastic ? 10.0f : detent_assist_fade_start;
-        const float stop = elastic ? 25.0f : detent_assist_cutoff;
-        iq *= std::clamp((stop - std::abs(velocity)) / (stop - start), 0.0f, 1.0f);
-    }
+    // Same assist attenuation and current ceiling for old and new detents.
+    iq = limit_haptic_current(iq, velocity, c.current_limit, c.mode == Mode::spring || endstop);
     return iq;
 }
 } // namespace knob

@@ -1,0 +1,639 @@
+{
+  "id": 1,
+  "device": "smartknob-s3",
+  "protocol": 1,
+  "control_stack_free": 4544,
+  "console_stack_free": 13872,
+  "firmware": "dma-v21-reference-parameters",
+  "reference_config_version": 1,
+  "reference_current_limit": 0.449999988079071,
+  "mode_count": 17,
+  "mode_name": "Detents",
+  "reference_preset": -1,
+  "modes": [
+    "Free",
+    "Detents",
+    "Bounded",
+    "Spring",
+    "Custom",
+    "Unbounded smooth",
+    "Bounded 0-10",
+    "Multi-rev smooth",
+    "On/off strong",
+    "Return to center",
+    "Fine smooth",
+    "Fine detents",
+    "Coarse strong",
+    "Coarse weak",
+    "Magnetic detents",
+    "Center detents",
+    "Frictionless"
+  ],
+  "frictionless": {
+    "phase": 0,
+    "reference": 0,
+    "correction": 0,
+    "feedforward": 0,
+    "angle_compensation": false
+  },
+  "pwm_profile": "20k65_sampling",
+  "app_elf_sha256": "b28133a99a58706885b1e0a8b3ee8fe27b5b6aa34bdc3c0a02258a4dd856afb8",
+  "current_sampling": "pwm_staggered_adc_done_experimental",
+  "current_phase_skew_us": 50,
+  "adc_sample_valid": true,
+  "adc_reject_reasons": 0,
+  "adc_reject_counts": {
+    "transport": 0,
+    "trigger": 0,
+    "pwm_tracking": 0,
+    "burst_timing": 0,
+    "phase_window": 0,
+    "pair_change": 0
+  },
+  "sampling_restart_required": false,
+  "adc_completed_mask": 7,
+  "adc_done_mask": 7,
+  "adc_done_raw_mask": 0,
+  "adc_done_down_mask": 0,
+  "adc_done_ticks": [
+    500,
+    485,
+    485
+  ],
+  "adc_done_words": [
+    28671,
+    36863,
+    28671
+  ],
+  "adc_armed_words": [
+    45055,
+    28671,
+    36863
+  ],
+  "adc_current_words": [
+    45055,
+    28671
+  ],
+  "adc_done_elapsed_us": [
+    10,
+    60,
+    110
+  ],
+  "adc_window_after_mask": 7,
+  "adc_trigger_elapsed_us": [
+    0,
+    50,
+    100
+  ],
+  "adc_pwm_compare_before": [
+    [
+      2000,
+      2000,
+      2000
+    ],
+    [
+      2000,
+      2000,
+      2000
+    ],
+    [
+      2000,
+      2000,
+      2000
+    ]
+  ],
+  "adc_pwm_compare_after": [
+    [
+      2000,
+      2000,
+      2000
+    ],
+    [
+      2000,
+      2000,
+      2000
+    ],
+    [
+      2000,
+      2000,
+      2000
+    ]
+  ],
+  "control_nominal_hz": 5000,
+  "encoder_nominal_hz": 2500,
+  "pwm_hz": 20000,
+  "pwm_half_period_ticks": 2000,
+  "pwm_resolution_hz": 80000000,
+  "pwm_duty_floor": 0,
+  "pwm_min_active_duty": 0,
+  "pwm_zero_clamp": true,
+  "pwm_duty_ceiling": 0.649999976158142,
+  "voltage_limit_automatic": true,
+  "max_voltage_limit": 7.29014539718628,
+  "available_voltage_limit": 7.29014539718628,
+  "configured_max_voltage_limit": 7.280386924743652,
+  "effective_voltage_limit": 7.29014539718628,
+  "bus_voltage_sensing": true,
+  "bus_voltage_source": "adc2_gpio11",
+  "bus_voltage": 19.426002502441406,
+  "bus_voltage_valid": true,
+  "bus_voltage_age_us": 5324,
+  "bus_voltage_raw": 2063,
+  "bus_voltage_adc_mv": 1766,
+  "bus_voltage_measured": 19.426002502441406,
+  "bus_voltage_error": 0,
+  "bus_voltage_divider": 11.000000953674316,
+  "detent_profile": "smart_knob",
+  "detent_quiet_velocity": false,
+  "haptic_position_filter": false,
+  "current_target_slew": false,
+  "host_lease_ms": 0,
+  "current_feedforward_ohms": 0,
+  "reset_reason": 11,
+  "uptime_ms": 12775,
+  "minimum_free_heap": 220604,
+  "current_limit_max": 4.5,
+  "strength_max": 1000,
+  "current_absolute_trip": 6,
+  "current_peak_trip": 5,
+  "current_peak_trip_ms": 1,
+  "current_overload_trip_ms": 20,
+  "current_trip_recovery_ratio": 4,
+  "current_trip_limit": 1,
+  "current_target_limit": 0,
+  "current_limited": false,
+  "quiet_output": false,
+  "haptic_scale": 0,
+  "speed_limited": false,
+  "haptic_paused": false,
+  "haptic_fade_start": 25,
+  "haptic_speed_cutoff": 40,
+  "haptic_resume_speed": 5,
+  "haptic_resume_hold_ms": 30,
+  "haptic_fade_in_ms": 500,
+  "detent_assist_fade_start": 10,
+  "detent_assist_cutoff": 25,
+  "elastic_min_damping": 0.03999999910593033,
+  "fault_current_valid": false,
+  "fault_current_trip_limit": 0,
+  "fault_currents": [
+    0,
+    0,
+    0
+  ],
+  "transport": "usb_serial_jtag",
+  "encoder": "MT6701",
+  "encoder_interface": "ssi_spi_dma",
+  "encoder_resolution_bits": 14,
+  "encoder_dma": true,
+  "weak_magnet_allowed": false,
+  "ok": true,
+  "state": "idle",
+  "fault": "none",
+  "hardware_detail": "none",
+  "hardware_error": 0,
+  "encoder_error": 0,
+  "fault_magnet": 0,
+  "encoder_failures": 0,
+  "encoder_retries": 0,
+  "voltage_d": 0,
+  "voltage_q": 0,
+  "angle": 4.854665756225586,
+  "velocity": 0,
+  "velocity_fast": 0,
+  "position": 0,
+  "sub_position": 27.815187454223633,
+  "iq": 0,
+  "id_current": 0,
+  "target": 0,
+  "magnet": 0,
+  "target_d": 0,
+  "current_valid": false,
+  "rejected_samples": 0,
+  "reused_samples": 0,
+  "missed_samples": 0,
+  "timing_skips": 0,
+  "adc_timing_skips": 0,
+  "encoder_timing_skips": 0,
+  "sampling_recoveries": 0,
+  "pwm_deferred": 0,
+  "pwm_peak_duty": 0,
+  "pwm_full_duty_cycles": 0,
+  "control_cycles": 63385,
+  "control_hz": 5000,
+  "control_interval_us": 200,
+  "control_max_us": 2,
+  "encoder_age_us": 170,
+  "encoder_age_max_us": 384,
+  "adc_dma_words": [
+    45055,
+    28671
+  ],
+  "adc_slot_words": [
+    28671,
+    45055,
+    28671
+  ],
+  "adc_trigger_ticks": [
+    -177,
+    -176,
+    -176
+  ],
+  "adc_callback_ticks": [
+    838,
+    799,
+    800
+  ],
+  "adc_trigger_sar": [
+    0,
+    0,
+    0
+  ],
+  "adc_callback_sar": [
+    0,
+    0,
+    0
+  ],
+  "adc_callback_elapsed_us": [
+    15,
+    64,
+    114
+  ],
+  "adc_slot_mask": 7,
+  "adc_trigger_down_mask": 7,
+  "adc_callback_down_mask": 0,
+  "pwm_compare_before": [
+    2000,
+    2000,
+    2000
+  ],
+  "pwm_compare_after": [
+    2000,
+    2000,
+    2000
+  ],
+  "pwm_latch_sequence": 253545,
+  "pwm_compare_valid": true,
+  "pwm_apply_delay_us": 0,
+  "sample_us": 114,
+  "loop_us": 22,
+  "encoder_us": 60,
+  "control_us": 2,
+  "sample_start_tick": -177,
+  "sample_end_tick": -176,
+  "currents": [
+    0,
+    0,
+    0
+  ],
+  "sense_volts": [
+    0,
+    0,
+    0
+  ],
+  "offsets": [
+    0,
+    0,
+    0
+  ],
+  "duty": [
+    0,
+    0,
+    0
+  ],
+  "config": {
+    "reference_modes": {
+      "4": {
+        "width": 0.1745329201221466,
+        "endstop": 1,
+        "snap": 0.550000011920929,
+        "bias": 0,
+        "strength": 0,
+        "damping": 0,
+        "scale": 0.0874999985098839,
+        "friction": 0,
+        "click": 0,
+        "position": 0,
+        "min_position": 0,
+        "max_position": -1,
+        "bounded": false,
+        "magnetic_positions": []
+      },
+      "5": {
+        "width": 0.1745329201221466,
+        "endstop": 1,
+        "snap": 0.75,
+        "bias": 0,
+        "strength": 0,
+        "damping": 0,
+        "scale": 0.03750000149011612,
+        "friction": 0.019999999552965164,
+        "click": 0,
+        "position": 0,
+        "min_position": 0,
+        "max_position": -1,
+        "bounded": false,
+        "magnetic_positions": []
+      },
+      "6": {
+        "width": 0.1745329201221466,
+        "endstop": 1,
+        "snap": 1.100000023841858,
+        "bias": 0,
+        "strength": 0,
+        "damping": 0,
+        "scale": 0.0625,
+        "friction": 0,
+        "click": 0,
+        "position": 0,
+        "min_position": 0,
+        "max_position": 10,
+        "bounded": true,
+        "magnetic_positions": []
+      },
+      "7": {
+        "width": 0.1745329201221466,
+        "endstop": 5,
+        "snap": 0.75,
+        "bias": 0,
+        "strength": 0,
+        "damping": 0,
+        "scale": 0.03750000149011612,
+        "friction": 0,
+        "click": 0,
+        "position": 0,
+        "min_position": 0,
+        "max_position": 72,
+        "bounded": true,
+        "magnetic_positions": []
+      },
+      "8": {
+        "width": 1.0471975803375244,
+        "endstop": 1,
+        "snap": 0.550000011920929,
+        "bias": 0,
+        "strength": 38,
+        "damping": 0.550000011920929,
+        "scale": 0.10000000149011612,
+        "friction": 0,
+        "click": 0,
+        "position": 0,
+        "min_position": 0,
+        "max_position": 1,
+        "bounded": true,
+        "magnetic_positions": []
+      },
+      "9": {
+        "width": 1.0471975803375244,
+        "endstop": 0.600000023841858,
+        "snap": 1.100000023841858,
+        "bias": 0,
+        "strength": 40,
+        "damping": 0.10000000149011612,
+        "scale": 0.20000000298023224,
+        "friction": 0.007499999832361937,
+        "click": 0,
+        "position": 0,
+        "min_position": 0,
+        "max_position": 0,
+        "bounded": true,
+        "magnetic_positions": []
+      },
+      "10": {
+        "width": 0.01745329238474369,
+        "endstop": 1,
+        "snap": 1.100000023841858,
+        "bias": 0,
+        "strength": 0,
+        "damping": 0.10000000149011612,
+        "scale": 0.07500000298023224,
+        "friction": 0,
+        "click": 0,
+        "position": 127,
+        "min_position": 0,
+        "max_position": 255,
+        "bounded": true,
+        "magnetic_positions": []
+      },
+      "11": {
+        "width": 0.01745329238474369,
+        "endstop": 1,
+        "snap": 0.899999976158142,
+        "bias": 0,
+        "strength": 0,
+        "damping": 0.10000000149011612,
+        "scale": 0.0625,
+        "friction": 0,
+        "click": 0.10000000149011612,
+        "position": 127,
+        "min_position": 0,
+        "max_position": 255,
+        "bounded": true,
+        "magnetic_positions": []
+      },
+      "12": {
+        "width": 0.1745329201221466,
+        "endstop": 1,
+        "snap": 0.75,
+        "bias": 0,
+        "strength": 28,
+        "damping": 0.1599999964237213,
+        "scale": 0.20000000298023224,
+        "friction": 0,
+        "click": 0,
+        "position": 0,
+        "min_position": 0,
+        "max_position": 31,
+        "bounded": true,
+        "magnetic_positions": []
+      },
+      "13": {
+        "width": 0.1745329201221466,
+        "endstop": 1,
+        "snap": 0.899999976158142,
+        "bias": 0,
+        "strength": 5,
+        "damping": 0.1599999964237213,
+        "scale": 0.20000000298023224,
+        "friction": 0,
+        "click": 0.3499999940395355,
+        "position": 0,
+        "min_position": 0,
+        "max_position": 31,
+        "bounded": true,
+        "magnetic_positions": []
+      },
+      "14": {
+        "width": 0.122173048555851,
+        "endstop": 1,
+        "snap": 0.699999988079071,
+        "bias": 0,
+        "strength": 40,
+        "damping": 0.20000000298023224,
+        "scale": 0.20000000298023224,
+        "friction": 0,
+        "click": 0,
+        "position": 0,
+        "min_position": 0,
+        "max_position": 31,
+        "bounded": true,
+        "magnetic_positions": [
+          2,
+          10,
+          21,
+          22
+        ]
+      },
+      "15": {
+        "width": 1.0471975803375244,
+        "endstop": 1,
+        "snap": 0.550000011920929,
+        "bias": 0.4000000059604645,
+        "strength": 10,
+        "damping": 0.10000000149011612,
+        "scale": 0.20000000298023224,
+        "friction": 0,
+        "click": 0,
+        "position": 0,
+        "min_position": -6,
+        "max_position": 6,
+        "bounded": true,
+        "magnetic_positions": []
+      }
+    },
+    "bus_voltage": 19.399999618530273,
+    "sense_gain": 0.15000000596046448,
+    "current_limit": 0.800000011920929,
+    "current_kp": 3,
+    "current_ki": 60,
+    "width": 0.1745329201221466,
+    "strength": 20,
+    "endstop": 20,
+    "damping": 0.003000000026077032,
+    "snap": 0.550000011920929,
+    "frictionless": {
+      "friction": 0.02199999988079071,
+      "viscous": 0.000303999986499548,
+      "scale": 1,
+      "hold_kp": 0.01600000075995922,
+      "hold_ki": 0.024000000208616257
+    },
+    "mode": 1,
+    "min_position": 0,
+    "max_position": 11
+  },
+  "calibration": {
+    "valid": true,
+    "direction": 1,
+    "pole_pairs": 7,
+    "electrical_zero": 0.2927631735801697
+  },
+  "calibration_quality": {
+    "method": "bidirectional_v1",
+    "verified": true,
+    "current": 0.25,
+    "voltage_limit": 3,
+    "forward_points": 29,
+    "reverse_points": 29,
+    "verification_points": 6,
+    "pole_pairs": 7.001340866088867,
+    "forward_pole_pairs": 7.000340461730957,
+    "reverse_pole_pairs": 7.00234079360962,
+    "direction_difference": 0.071999728679657,
+    "hysteresis_max": 0.1782517433166504,
+    "residual_rms": 0.10655800998210907,
+    "residual_max": 0.262499749660492,
+    "verification_max": 0.10759782791137695,
+    "phase_check_passed": true,
+    "offset_noise_a": [
+      0.025200147181749344,
+      0.02221992239356041,
+      0.018970932811498642
+    ],
+    "offset_sem_a": [
+      0.0011136997491121292,
+      0.0009819911792874336,
+      0.000838404695969075
+    ],
+    "offset_drift_a": [
+      0,
+      0,
+      0
+    ]
+  },
+  "calibration_report": {
+    "method": "bidirectional_v1",
+    "stage": "not_run",
+    "error": "none",
+    "passed": false,
+    "cancelled": false,
+    "attempts": 0,
+    "point": 0,
+    "elapsed_s": 0,
+    "zero_forward": 0,
+    "zero_reverse": 0,
+    "observed_d": 0,
+    "observed_q": 0,
+    "tracking_error": 0,
+    "saturation_fraction": 0,
+    "current": 0,
+    "voltage_limit": 0,
+    "forward_points": 0,
+    "reverse_points": 0,
+    "verification_points": 0,
+    "pole_pairs": 0,
+    "forward_pole_pairs": 0,
+    "reverse_pole_pairs": 0,
+    "direction_difference": 0,
+    "hysteresis_max": 0,
+    "residual_rms": 0,
+    "residual_max": 0,
+    "verification_max": 0,
+    "phase_check_passed": false,
+    "offset_noise_a": [
+      0,
+      0,
+      0
+    ],
+    "offset_sem_a": [
+      0,
+      0,
+      0
+    ],
+    "offset_drift_a": [
+      0,
+      0,
+      0
+    ],
+    "phase_a_response": [
+      0,
+      0,
+      0
+    ],
+    "phase_b_response": [
+      0,
+      0,
+      0
+    ],
+    "phase_c_response": [
+      0,
+      0,
+      0
+    ]
+  },
+  "offset_noise_a": [
+    0,
+    0,
+    0
+  ],
+  "offset_sem_a": [
+    0,
+    0,
+    0
+  ],
+  "offset_drift_a": [
+    0,
+    0,
+    0
+  ]
+}

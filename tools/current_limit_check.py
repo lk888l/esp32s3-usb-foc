@@ -11,7 +11,7 @@ import json
 import math
 import time
 from pathlib import Path
-from knobctl import Knob
+from knobctl import Knob, common_configuration
 
 
 def require(condition, message):
@@ -97,23 +97,23 @@ def main():
         passed("staged_overcurrent_policy_telemetry")
         report["initial"] = initial
         original = initial["config"]
-        reject = device.request("configure", {**original, "current_limit": 4.51}, allow_error=True)
+        reject = device.request("configure", {**common_configuration(original), "current_limit": 4.51}, allow_error=True)
         require(not reject["ok"] and reject["error"] == "current_limit_range", "4.51 A accepted")
         require(device.request("status")["config"] == original, "Rejected config mutated settings")
         passed("reject_above_4.5A_atomically")
-        maximum = device.request("configure", {**original, "current_limit": 4.5})
+        maximum = device.request("configure", {**common_configuration(original), "current_limit": 4.5})
         require(maximum["state"] == "idle" and maximum["config"]["current_limit"] == 4.5,
                 "Maximum capability was not accepted while idle")
         require(maximum["duty"] == [0, 0, 0], "Idle capability check energized the motor")
         passed("accept_4.5A_while_idle")
         for mode in range(4):
             config = {**original, "mode": mode, "current_limit": args.max_current}
-            device.request("configure", config)
+            device.request("configure", common_configuration(config))
             enable_when_ready(device, report, mode)
             device.wait_active()
             for limit in (args.max_current, min(.2, args.max_current), args.max_current, .02, args.max_current):
                 config["current_limit"] = limit
-                ack = device.request("configure", config)
+                ack = device.request("configure", common_configuration(config))
                 require(ack["state"] == "active", "Live update disabled the motor")
                 require(abs(ack["config"]["current_limit"] - limit) < 1e-5, "Acknowledged limit differs")
                 # A downward change grants the winding 20 ms to settle, without
@@ -138,7 +138,7 @@ def main():
             if device.identified:
                 device.request("disable")
                 if original is not None:
-                    device.request("configure", original)
+                    device.request("configure", common_configuration(original))
                 report["final"] = device.request("status")
         finally:
             device.close()

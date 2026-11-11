@@ -77,4 +77,13 @@ int main() {
     DiagnosticPlan legacy;
     assert(valid_diagnostic_plan(legacy, .08f)); // Existing q stimulus is still limited by the live current budget.
     assert(legacy.axis == DiagnosticAxis::q);
+    DiagnosticPlan hold{Mode::frictionless, 1, .1f, 3000000, 10000000};
+    assert(valid_diagnostic_plan(hold, .1f));
+    const int hold_period = diagnostic_capture_period_us(hold);
+    assert((hold.drive_us + hold.observe_us - 1) / hold_period + 1 <= diagnostic_capacity);
+    hold.drive_us++; assert(!valid_diagnostic_plan(hold, .1f)); hold.drive_us--;
+    hold.observe_us++; assert(!valid_diagnostic_plan(hold, .1f)); hold.observe_us--;
+    hold.velocity = .999f; assert(!valid_diagnostic_plan(hold, .1f));
+    hold.velocity = -1; assert(valid_diagnostic_plan(hold, .1f));
+    hold.mode = static_cast<Mode>(mode_count); assert(!valid_diagnostic_plan(hold, .1f));
 }

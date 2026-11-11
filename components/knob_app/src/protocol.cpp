@@ -2,6 +2,8 @@
 #include "board.hpp"
 #include "encoder_config.hpp"
 #include "settings_identity.hpp"
+#include "reference_modes.hpp"
+#include "reference_json.hpp"
 #include "nvs.h"
 #include "esp_crc.h"
 #include "esp_system.h"
@@ -24,6 +26,11 @@ constexpr Field fields[] = {{"bus_voltage", &Config::bus_voltage}, {"sense_gain"
     {"current_limit", &Config::current_limit},
     {"current_kp", &Config::current_kp}, {"current_ki", &Config::current_ki}, {"width", &Config::width},
     {"strength", &Config::strength}, {"endstop", &Config::endstop}, {"damping", &Config::damping}, {"snap", &Config::snap}};
+struct FrictionlessField { const char* name; float FrictionlessConfig::*member; };
+constexpr FrictionlessField frictionless_fields[] = {
+    {"friction", &FrictionlessConfig::friction}, {"viscous", &FrictionlessConfig::viscous},
+    {"scale", &FrictionlessConfig::scale}, {"hold_kp", &FrictionlessConfig::hold_kp},
+    {"hold_ki", &FrictionlessConfig::hold_ki}};
 void array(cJSON* obj, const char* name, const std::array<float, 3>& values) {
     cJSON_AddItemToObject(obj, name, cJSON_CreateFloatArray(values.data(), values.size()));
 }
@@ -35,6 +42,15 @@ void numeric_array(cJSON* obj, const char* name, const std::array<T, N>& values)
 }
 struct Stored { uint32_t version; Config config; Calibration calibration; uint32_t crc; };
 struct StoredQuality { SavedCalibrationQuality record; uint32_t crc; };
+// Separate record leaves the original 56-byte Config and calibration intact.
+struct StoredFrictionless { uint32_t version; FrictionlessConfig config; uint32_t crc; };
+struct StoredReferenceModesV1 { uint32_t version; ReferenceModeBankV1 modes; uint32_t crc; };
+struct StoredReferenceModes { uint32_t version; ReferenceModeBank modes; uint32_t crc; };
+bool valid_reference_modes(const ReferenceModeBank& modes) {
+    for (int i = 0; i < reference_config_count; ++i)
+        if (validate_reference_config(modes[i], i)) return false;
+    return true;
+}
 void quality_fields(cJSON* object, const CalibrationQuality& q) {
     cJSON_AddNumberToObject(object, "current", q.current);
     cJSON_AddNumberToObject(object, "voltage_limit", q.voltage_limit);
@@ -77,6 +93,10 @@ const char* decode_request(const char* line, Request& r) {
     bool found = false;
     for (auto n : names) if (!std::strcmp(op->valuestring, n.name)) { r.op = n.op; found = true; }
     if (!found) return fail("unknown_op");
+    if (const auto* defaults = cJSON_GetObjectItemCaseSensitive(root, "reference_defaults")) {
+        if (r.op != Op::status || !cJSON_IsBool(defaults)) return fail("reference_defaults_status_only");
+        r.reference_defaults = cJSON_IsTrue(defaults);
+    }
     if (r.op == Op::calibrate) {
         struct Parameter { const char* name; float CalibrationPlan::*member; };
         constexpr Parameter parameters[] = {{"current", &CalibrationPlan::current},
@@ -128,11 +148,11 @@ const char* decode_request(const char* line, Request& r) {
             if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble)) return fail("diagnostic_fields_required");
             values[i] = item->valuedouble;
         }
-        if (values[0] < 0 || values[0] > 3 || std::floor(values[0]) != values[0] ||
-            (d_axis ? values[1] != 0 : std::abs(values[1]) < 10 || std::abs(values[1]) > 60) ||
+        if (values[0] < 0 || values[0] >= mode_count || std::floor(values[0]) != values[0] ||
+            (d_axis ? values[1] != 0 : std::abs(values[1]) < 1 || std::abs(values[1]) > 60) ||
             values[2] < (d_axis ? .05 : .02) || values[2] > (d_axis ? 3 : .25) ||
-            values[3] < 50 || values[3] > (d_axis ? 30000 : 500) ||
-            values[4] < (d_axis ? 100 : 500) || values[4] > (d_axis ? 1000 : 3000))
+            values[3] < 50 || values[3] > (d_axis ? 30000 : 3000) ||
+            values[4] < (d_axis ? 100 : 500) || values[4] > (d_axis ? 1000 : 10000))
             return fail("diagnostic_range");
         r.diagnostic = {static_cast<Mode>(static_cast<int>(values[0])), static_cast<float>(values[1]),
             static_cast<float>(values[2]), static_cast<int>(values[3] * 1000), static_cast<int>(values[4] * 1000),
@@ -166,6 +186,22 @@ const char* decode_request(const char* line, Request& r) {
             else r.config.mode = static_cast<Mode>(item->valueint);
         }
         if (const char* error = validate(r.config)) return fail(error);
+        const auto* frictionless = cJSON_GetObjectItemCaseSensitive(c, "frictionless");
+        if (frictionless) {
+            if (!cJSON_IsObject(frictionless)) return fail("frictionless_config_required");
+            for (auto f : frictionless_fields) {
+                const auto* item = cJSON_GetObjectItemCaseSensitive(frictionless, f.name);
+                if (!cJSON_IsNumber(item) || !std::isfinite(item->valuedouble))
+                    return fail("frictionless_field_missing");
+                r.frictionless_config.*(f.member) = static_cast<float>(item->valuedouble);
+            }
+            if (const char* error = validate_frictionless(r.frictionless_config)) return fail(error);
+            r.frictionless_update = true;
+        }
+        if (const auto* references = cJSON_GetObjectItemCaseSensitive(c, "reference_modes")) {
+            if (const char* error = decode_reference_modes(references, r.reference_modes, r.reference_update_mask))
+                return fail(error);
+        }
     }
     cJSON_Delete(root); return nullptr;
 }
@@ -177,7 +213,29 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "protocol", 1);
     cJSON_AddNumberToObject(root, "control_stack_free", s.control_stack_free);
     cJSON_AddNumberToObject(root, "console_stack_free", uxTaskGetStackHighWaterMark(nullptr));
-    cJSON_AddStringToObject(root, "firmware", "dma-v19-bidirectional-calibration");
+    cJSON_AddStringToObject(root, "firmware", "dma-v22-independent-detents");
+    cJSON_AddNumberToObject(root, "reference_config_version", reference_config_version);
+    cJSON_AddNumberToObject(root, "reference_current_limit", reference_current_limit);
+    cJSON_AddStringToObject(root, "reference_haptic_model", "esp32_detent_v2");
+    if (r.reference_defaults) {
+        cJSON* defaults = encode_reference_modes(default_reference_modes());
+        if (!defaults) { cJSON_Delete(root); return nullptr; }
+        cJSON_AddItemToObject(root, "reference_defaults", defaults);
+    }
+    cJSON_AddNumberToObject(root, "mode_count", mode_count);
+    const int mode = static_cast<int>(s.config.mode);
+    constexpr const char* legacy_names[] = {"Free", "Detents", "Bounded", "Spring"};
+    cJSON_AddStringToObject(root, "mode_name", mode < 4 ? legacy_names[mode] : reference_mode_name(mode - 4));
+    cJSON_AddNumberToObject(root, "reference_preset", mode >= 4 ? mode - 4 : -1);
+    cJSON* modes = cJSON_AddArrayToObject(root, "modes");
+    for (int i = 0; i < mode_count; ++i)
+        cJSON_AddItemToArray(modes, cJSON_CreateString(i < 4 ? legacy_names[i] : reference_mode_name(i - 4)));
+    cJSON* hold = cJSON_AddObjectToObject(root, "frictionless");
+    cJSON_AddNumberToObject(hold, "phase", s.frictionless_phase);
+    cJSON_AddNumberToObject(hold, "reference", s.frictionless_reference);
+    cJSON_AddNumberToObject(hold, "correction", s.frictionless_correction);
+    cJSON_AddNumberToObject(hold, "feedforward", s.frictionless_feedforward);
+    cJSON_AddBoolToObject(hold, "angle_compensation", false);
     cJSON_AddStringToObject(root, "pwm_profile", pwm_profile_name);
     const auto* app = esp_app_get_description();
     char app_sha256[65]{};
@@ -322,9 +380,13 @@ cJSON* encode_reply(int id, const Reply& r) {
                                   v.scale, v.voltage_q, v.phase_peak, double(v.flags), v.velocity_fast, v.voltage_d,
                                   double(v.adc_raw_a), double(v.adc_raw_b),
                                   double(v.sample_start_tick), double(v.sample_end_tick), v.target_d};
-            // Keep the legacy q trace layout; d tests append their actual Id target.
-            cJSON_AddItemToArray(samples, cJSON_CreateDoubleArray(row,
-                s.diagnostic.axis == DiagnosticAxis::d ? 17 : 16));
+            // Preserve q columns 0..15 and d's target at column 16.
+            cJSON* sample = cJSON_CreateDoubleArray(row, s.diagnostic.axis == DiagnosticAxis::d ? 17 : 16);
+            if (s.diagnostic.axis != DiagnosticAxis::d) {
+                for (float value : {v.hold_phase, v.hold_reference, v.hold_correction, v.hold_feedforward})
+                    cJSON_AddItemToArray(sample, cJSON_CreateNumber(value));
+            }
+            cJSON_AddItemToArray(samples, sample);
         }
     }
 #endif
@@ -396,7 +458,12 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "sample_start_tick", s.sample_start_tick); cJSON_AddNumberToObject(root, "sample_end_tick", s.sample_end_tick);
     array(root, "currents", s.currents); array(root, "sense_volts", s.volts); array(root, "offsets", s.offsets); array(root, "duty", s.duty);
     cJSON* config = cJSON_AddObjectToObject(root, "config");
+    cJSON* references = encode_reference_modes(s.reference_modes);
+    if (!config || !references) { cJSON_Delete(references); cJSON_Delete(root); return nullptr; }
+    cJSON_AddItemToObject(config, "reference_modes", references);
     for (auto f : fields) cJSON_AddNumberToObject(config, f.name, s.config.*(f.member));
+    cJSON* frictionless = cJSON_AddObjectToObject(config, "frictionless");
+    for (auto f : frictionless_fields) cJSON_AddNumberToObject(frictionless, f.name, s.frictionless_config.*(f.member));
     cJSON_AddNumberToObject(config, "mode", static_cast<int>(s.config.mode));
     cJSON_AddNumberToObject(config, "min_position", s.config.min_position); cJSON_AddNumberToObject(config, "max_position", s.config.max_position);
     cJSON* cal = cJSON_AddObjectToObject(root, "calibration");
@@ -431,13 +498,19 @@ cJSON* encode_reply(int id, const Reply& r) {
     array(root, "offset_drift_a", s.offset_drift_a);
     return root;
 }
-bool load_settings(Config& c, Calibration& cal, CalibrationQuality& quality) {
+bool load_settings(Config& c, Calibration& cal, CalibrationQuality& quality, FrictionlessConfig& frictionless, ReferenceModeBank& reference_modes) {
     nvs_handle_t handle;
     if (nvs_open("smartknob", NVS_READONLY, &handle) != ESP_OK) return false;
     Stored data{}; size_t length = sizeof(data);
     const auto err = nvs_get_blob(handle, "settings_v1", &data, &length);
     StoredQuality saved_quality{}; size_t quality_length = sizeof(saved_quality);
     const auto quality_error = nvs_get_blob(handle, "cal_quality", &saved_quality, &quality_length);
+    StoredFrictionless saved_frictionless{}; size_t frictionless_length = sizeof(saved_frictionless);
+    const auto frictionless_error = nvs_get_blob(handle, "frictionless_v1", &saved_frictionless, &frictionless_length);
+    StoredReferenceModes saved_references{}; size_t reference_length = sizeof(saved_references);
+    const auto reference_error = nvs_get_blob(handle, "reference_v2", &saved_references, &reference_length);
+    StoredReferenceModesV1 legacy_references{}; size_t legacy_reference_length = sizeof(legacy_references);
+    const auto legacy_reference_error = nvs_get_blob(handle, "reference_v1", &legacy_references, &legacy_reference_length);
     nvs_close(handle);
     if (err != ESP_OK || length != sizeof(data) ||
         data.crc != esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&data), offsetof(Stored, crc))) return false;
@@ -448,10 +521,29 @@ bool load_settings(Config& c, Calibration& cal, CalibrationQuality& quality) {
         saved_quality.crc == esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&saved_quality), offsetof(StoredQuality, crc)) &&
         quality_matches(saved_quality.record, cal, encoder_config::calibration_id, c.sense_gain))
         quality = saved_quality.record.quality;
+    frictionless = {};
+    if (frictionless_error == ESP_OK && frictionless_length == sizeof(saved_frictionless) &&
+        saved_frictionless.version == 1 && !validate_frictionless(saved_frictionless.config) &&
+        saved_frictionless.crc == esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&saved_frictionless), offsetof(StoredFrictionless, crc)))
+        frictionless = saved_frictionless.config;
+    // Missing, incompatible or damaged reference records use factory presets;
+    // they never invalidate the original electrical settings or calibration.
+    reference_modes = default_reference_modes();
+    if (reference_error == ESP_OK && reference_length == sizeof(saved_references) &&
+        saved_references.version == reference_config_version &&
+        saved_references.crc == esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&saved_references), offsetof(StoredReferenceModes, crc)) &&
+        valid_reference_modes(saved_references.modes))
+        reference_modes = saved_references.modes;
+    // Only migrate when v2 is absent. A corrupt v2 must not resurrect stale v1 tuning.
+    else if (reference_error == ESP_ERR_NVS_NOT_FOUND && legacy_reference_error == ESP_OK &&
+        legacy_reference_length == sizeof(legacy_references) && legacy_references.version == 1 &&
+        legacy_references.crc == esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&legacy_references), offsetof(StoredReferenceModesV1, crc)))
+        migrate_reference_modes(legacy_references.modes, reference_modes);
     return true;
 }
-bool save_settings(const Config& c, const Calibration& cal, const CalibrationQuality& quality) {
-    if (validate(c) || (cal.valid && !valid_calibration(cal))) return false;
+bool save_settings(const Config& c, const Calibration& cal, const CalibrationQuality& quality, const FrictionlessConfig& frictionless, const ReferenceModeBank& reference_modes) {
+    if (validate(c) || validate_frictionless(frictionless) || !valid_reference_modes(reference_modes) ||
+        (cal.valid && !valid_calibration(cal))) return false;
     StoredQuality saved_quality{};
     saved_quality.record.calibration = cal;
     saved_quality.record.encoder_id = encoder_config::calibration_id;
@@ -464,9 +556,17 @@ bool save_settings(const Config& c, const Calibration& cal, const CalibrationQua
     Stored data{}; data.version = encoder_settings_version(encoder_config::calibration_id);
     data.config = c; data.calibration = cal;
     data.crc = esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&data), offsetof(Stored, crc));
+    StoredFrictionless saved_frictionless{1, frictionless, 0};
+    saved_frictionless.crc = esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&saved_frictionless), offsetof(StoredFrictionless, crc));
+    StoredReferenceModes saved_references{};
+    saved_references.version = reference_config_version;
+    saved_references.modes = reference_modes;
+    saved_references.crc = esp_crc32_le(0, reinterpret_cast<const uint8_t*>(&saved_references), offsetof(StoredReferenceModes, crc));
     // A stale/partially saved sidecar is never trusted: it is bound to the exact
     // encoder, gain and calibration above and independently CRC-protected.
-    const bool ok = nvs_set_blob(handle, "cal_quality", &saved_quality, sizeof(saved_quality)) == ESP_OK &&
+    const bool ok = nvs_set_blob(handle, "reference_v2", &saved_references, sizeof(saved_references)) == ESP_OK &&
+        nvs_set_blob(handle, "frictionless_v1", &saved_frictionless, sizeof(saved_frictionless)) == ESP_OK &&
+        nvs_set_blob(handle, "cal_quality", &saved_quality, sizeof(saved_quality)) == ESP_OK &&
         nvs_set_blob(handle, "settings_v1", &data, sizeof(data)) == ESP_OK && nvs_commit(handle) == ESP_OK;
     nvs_close(handle); return ok;
 }

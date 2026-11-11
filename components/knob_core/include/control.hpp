@@ -62,7 +62,14 @@ static_assert(!pwm_zero_clamp || duty_floor <= duty_ceiling * .09f);
 // Invalid bus readings provide no output capacity; callers must also stop on
 // missing/stale measurements rather than substituting a configured voltage.
 KNOB_IRAM float max_output_voltage(float bus_voltage);
-enum class Mode : int { free, detents, bounded, spring };
+// Preserve the original USB/NVS values. Reference preset p is mode 4+p.
+enum class Mode : int { free, detents, bounded, spring, reference_custom,
+    reference_free, reference_bounded, reference_multi_rev, reference_on_off,
+    reference_center, reference_fine_smooth, reference_fine_detents,
+    reference_coarse_strong, reference_coarse_weak, reference_magnetic,
+    reference_center_detents, frictionless };
+constexpr int mode_count = 17;
+constexpr bool reference_mode(Mode mode) { return static_cast<int>(mode) >= 4; }
 struct Config {
     float bus_voltage = 19.4f;
     float sense_gain = 0.15f; // V/A; minimum supported gain gives conservative current estimates.
@@ -178,6 +185,9 @@ private:
     float scale_ = 1, quiet_s_ = 0;
     bool paused_ = false;
 };
+// Shared original-detent force law, independent of mode geometry and storage.
+KNOB_IRAM float detent_current(float error, float velocity, float width, float strength, float damping);
+KNOB_IRAM float limit_haptic_current(float requested, float velocity, float limit, bool elastic);
 class Haptics {
 public:
     void reset(float angle, int position = 0) { center_ = angle; origin_ = angle; position_ = position; }

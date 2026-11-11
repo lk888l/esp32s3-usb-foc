@@ -9,7 +9,7 @@ import json
 import time
 from pathlib import Path
 
-from knobctl import Knob
+from knobctl import Knob, common_configuration
 
 
 def capture(args):
@@ -30,7 +30,7 @@ def capture(args):
         config = {**original, "mode": 3}
         if args.current is not None:
             config["current_limit"] = args.current
-        report["configured"] = device.request("configure", config)
+        report["configured"] = device.request("configure", common_configuration(config))
         report["enabled"] = device.request("enable")
         started = time.monotonic()
         wait_for_target = getattr(args, "wait_for_target", 0)
@@ -90,7 +90,7 @@ def capture(args):
                     cleanup_errors.append("disable could not be confirmed: " + "; ".join(stop_errors))
                 if original is not None and stopped:
                     try:
-                        report["restored"] = device.request("configure", original)
+                        report["restored"] = device.request("configure", common_configuration(original))
                     except Exception as error:
                         cleanup_errors.append("restore: " + str(error))
                 try:

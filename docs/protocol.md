@@ -1,6 +1,63 @@
 # SmartKnob USB 协议 v1
 
-当前固件为 **`dma-v19-bidirectional-calibration`**，协议仍为 v1，沿用 `20k65_sampling`、20 kHz PWM 和 5 kHz 控制。2026-11-05 的 5 kHz / 90% 与 10 kHz / 85% 占空比实验已按用户要求回滚，详见[实验与最终恢复记录](duty90-20261105.md)。采样检查工具按设备 `control_nominal_hz` 的 98% 设置默认有效频率门槛，并验证实际锁存 duty；失败后停止后续电流阶梯。
+当前固件为 **`dma-v22-independent-detents`**，协议仍为 v1，沿用 `20k65_sampling`、20 kHz PWM 和 5 kHz 控制。2026-11-05 的 5 kHz / 90% 与 10 kHz / 85% 占空比实验已按用户要求回滚，详见[实验与最终恢复记录](duty90-20261105.md)。采样检查工具按设备 `control_nominal_hz` 的 98% 设置默认有效频率门槛，并验证实际锁存 duty；失败后停止后续电流阶梯。
+
+## 2026-11-11 v22：物理单位与独立点击开关
+
+`reference_config_version:2`、`reference_haptic_model:"esp32_detent_v2"` 标识新版参数语义。沿用模式 4–15 的独立完整条目补丁、停机应用、只读默认值查询和显式 save。省略整个参数库或某个模式时仍保留设备现有值。相同参数重发不重置正在运行的模式。
+
+相对下方 v21 表格，改变如下；其余几何字段和范围保持：
+
+| 字段 | v22 定义 |
+| --- | --- |
+| `strength` | 档位弹力系数，0–1000 A/rad |
+| `damping` | 档位内部速度阻尼，0–0.5 A·s/rad |
+| `endstop` | 端点弹力系数，0–20 A/rad，不再乘 4 |
+| `endstop_damping` | 新增必填数值，端点速度阻尼，0–0.5 A·s/rad |
+| `click_enabled` | 新增必填布尔值，决定是否自动产生切档脉冲；默认 false |
+| `click` | 0–0.45 A，仅在点击开启时使用；关闭不清空幅值；模式 14 也可启用，限进入吸附档位时触发 |
+| `scale` | 当前模式的弹力/阻尼倍率，0–1，默认 1；摩擦补偿与点击电流不乘此值 |
+
+中心死区仍为 `min(width*0.2, 1°)`，档位电流与原模式共用 `strength*有效角误差 - damping*角速度`，静止死区归零；端点没有中心死区，采用完整误差和独立端点阻尼。点击必须完成两段后才能接受下一次切档，快速跨档不重启第一段。合成点击/摩擦后按运行电流限幅，并沿用原档位的高速正功衰减。`reference_current_limit:4.5` 为硬件能力上限，实际由 `config.current_limit` 进一步限制；不再额外限制为 0.45 A。
+
+保存写独立版本/CRC 记录 `reference_v2`。v2 缺失时才尝试有效的旧 `reference_v1`：逐条与原始预设比较，未修改条目使用新版默认值；自定义条目保留几何，`strength=旧strength*旧scale`，`damping=旧damping*旧scale`，`endstop=4*旧endstop*旧scale`，端点阻尼取转换后的旧阻尼，最后 `scale=1`。阻尼/端点分别限制至 0.5 / 20，点击保留幅值但置 false。旧记录无效时使用默认库，迁移不自动写 Flash。仅 v2 记录损坏时回退新版默认，不复活旧库。电气配置、校准和无摩擦记录布局不变。
+
+旧 v21 上位机不能按新含义写参数，需要配套新版 cf-gui；新版上位机仍按版本显示和验证 v1。请求/回复容量分别保持 2047 / 32768 字节。算法、点击计时、保护全部由 ESP32 执行，未增加主机心跳依赖。
+
+## 2026-11-07 v21：每模式参数库（历史契约）
+
+`reference_config_version:1` 表示模式 4–15 支持独立参数。正常状态在 `config.reference_modes` 返回全部 12 项，以模式编号字符串为键。`reference_current_limit` 报告保留的普通参考模式电流限制 0.45 A；公共 `config.current_limit` 仍可进一步限制输出。
+
+`configure.config` 仍携带完整公共配置；可选的 `reference_modes` **只包含需要修改的模式**，每个列出的模式必须带齐下面所有字段。省略的模式保持原值；空对象无变化。任何字段或模式非法都拒绝整个请求，不部分应用。仅实际发生变化的参考参数要求 `state=idle`，否则返回 `disable_before_reference_config`；同值重发不重置运行状态。仅切换 `config.mode` 沿用现有行为。
+
+| 字段 | 含义与范围 |
+| --- | --- |
+| `bounded` | 布尔值；是否启用行程边界 |
+| `position` | 重新启用/归零时的初始逻辑档位，整数 −10000–10000 |
+| `min_position`, `max_position` | 边界整数 −10000–10000；bounded=true 时须 min ≤ position ≤ max；false 时忽略排序，旧无界默认保留 0/−1 |
+| `width` | 档距，rad；1°–180° |
+| `strength`, `damping` | 参考控制器缩放前的档位 P 增益 0–100、速度 D 增益 0–5 |
+| `endstop` | 缩放前端点增益，0–20；控制器使用其 4 倍 |
+| `scale` | 输出倍率，0–1；作用于 P/D/端点项 |
+| `snap`, `bias` | 以档距为单位的切换阈值与中心偏置；snap 0.5–2，bias 0–1.5 且 bias ≤ snap−0.05 |
+| `friction`, `click` | 摩擦补偿与点击电流，A，0–0.45；磁性模式不使用点击项 |
+| `magnetic_positions` | 模式 14 最多 8 个互异整数档位；有界时须在边界内。其他模式必须为空数组 |
+
+参考控制器先计算 `scale × clamp(gain × position_error − damping × velocity, −10, 10)`，再加入摩擦和点击项；端点处 gain 为 `4 × endstop`，其余为 strength。最终仍受 0.45 A、用户电流上限及速度/故障保护约束。增益本身不能直接当作输出安培数。默认参数保持 v20 参考手感；Custom 的零力矩默认值现在也可编辑。
+
+默认值使用只读请求 `{"id":1,"op":"status","reference_defaults":true}` 获取，回复追加完整 `reference_defaults` 参数库；不会应用、保存或改变当前模式。该布尔参数仅接受在 status 上使用。上位机“恢复默认”应先装入草稿，再由用户明确应用。
+
+显式 save 将全部参数库写入独立版本/CRC 记录 `reference_v1`，保持原 `settings_v1`、校准与 `frictionless_v1` 布局兼容；旧 NVS 缺少该记录或版本/CRC/参数非法时回退到固件默认库。上电仍为 idle。通信请求正文上限仍为 2047 字节，cf-gui 保留 1900 字节限额以容纳请求 id，通常一次只编辑一个模式。完整回复接收上限扩到 **32768 字节**，默认库仅按需传输。任务栈为 control 9216 / console 24576 字节，控制器仍在独立高优先级任务中运行。
+
+完整状态配置含 12 项参数库，不能直接整对象回传为 configure。仓库中的旧参数测试脚本和 `knobctl --mode` 使用 `common_configuration()` 复制公共/无摩擦参数并省略 `reference_modes`，使设备保留现有参数库；测试备份与最终完整配置比较仍含参数库。`knobctl --config` 中用户显式提供的单模式补丁保持原样，超长请求仍报错。定时脚本原有的结束停机与 RAM 恢复顺序不变。
+
+## 2026-11-06 v20：参考预设与无摩擦模式（历史基线）
+
+`config.mode` 接受 0–16。原 0=free、1=detents、2=bounded、3=spring 不变；4–16 对应 RollerCAN 参考预设 0–12，**16 为无摩擦**。`modes` 字符串数组的下标就是 ESP32 编号，`mode_name` 和 `reference_preset` 提供当前名称和参考编号（旧模式为 -1）。新增普通预设使用参考的固定几何/手感，旧 width/strength/damping 等仅用于原模式，current_limit 继续约束所有模式；普通参考预设合成 pulse 后仍不超过 0.45 A。
+
+完整 `configure.config` 可附加 `frictionless:{friction,viscous,scale,hold_kp,hold_ki}`，提供该对象时五项必须齐全；遗漏则保留当前值，兼容旧客户端。单位分别为 A、A/(rad/s)、无量纲、A/(rad/s)、A/rad。范围依次是 0–0.8、0–0.02、0–10、0–1、0–5。`scale=0` 为持续零 Iq 对照。参数随显式 save 写入独立 CRC 记录 `frictionless_v1`，原 settings_v1 的 56 字节 Config 与校准布局不变。上电仍停机。
+
+顶层 `frictionless` 遥测含 phase（0静止、1诊断观察、2保持、3让步、4起拨获取）、reference（rad/s）、correction 和 feedforward（A），angle_compensation=false。无摩擦静止时继续零 Iq 闭环，因此 quiet_output=false；pulse 在此模式不产生点击。25–40 rad/s 原速度包络、限流和故障保护保留。模式表、具体机制、参考移植差异与本轮实机结果见[运行模式记录](reference-modes-20261106.md)。
 
 ## 2026-11-06 v19：双向校准、质量记录与结果保留
 
@@ -162,7 +219,7 @@ USB 发送改为每次最多 **512 字节**，修复扩展诊断回复超过 409
 
 ## 传输与请求
 
-默认使用 DevKitC 的原生 USB Serial/JTAG（板上 USB 口，GPIO19/20）；主机统一以 115200、8N1、无流控打开串口，原生 USB 不受该波特率限制。编译时可选 COM/UART0，此时 115200 为实际线路速率。两者由 `CONFIG_KNOB_CONSOLE_USB` / `CONFIG_KNOB_CONSOLE_UART` 互斥选择，USB 能枚举或输出日志不能证明其已启用调参。每条请求/回复是一个 UTF-8 JSON 对象，以 LF 结束。请求最大 2047 字节；主机接受最多 16384 字节的一行。超长帧丢弃到 LF，不把尾部当成新命令。日志行不属于协议；默认 `CONFIG_ESP_CONSOLE_NONE=y` 避免应用日志与 JSON 混流。回复前后均带 LF，主机忽略空行与启动日志。一次请求对应一次回复，无主动推送。USB TX 支持部分写入并限制等待时间，后续帧前的 LF 可恢复被中断的帧边界。
+默认使用 DevKitC 的原生 USB Serial/JTAG（板上 USB 口，GPIO19/20）；主机统一以 115200、8N1、无流控打开串口，原生 USB 不受该波特率限制。编译时可选 COM/UART0，此时 115200 为实际线路速率。两者由 `CONFIG_KNOB_CONSOLE_USB` / `CONFIG_KNOB_CONSOLE_UART` 互斥选择，USB 能枚举或输出日志不能证明其已启用调参。每条请求/回复是一个 UTF-8 JSON 对象，以 LF 结束。请求最大 2047 字节；v21 主机接受最多 32768 字节的一行。超长帧丢弃到 LF，不把尾部当成新命令。日志行不属于协议；默认 `CONFIG_ESP_CONSOLE_NONE=y` 避免应用日志与 JSON 混流。回复前后均带 LF，主机忽略空行与启动日志。一次请求对应一次回复，无主动推送。USB TX 支持部分写入并限制等待时间，后续帧前的 LF 可恢复被中断的帧边界。
 
 ```json
 {"id":1,"op":"status"}
@@ -237,9 +294,9 @@ NVS 的 `smartknob/settings_v1` 基础配置/校准布局保留，另以 `cal_qu
 | damping | A·s/rad，0–0.5；v6 普通挡位在整个挡距使用速度阻尼，中心静止门限见下文 |
 | snap | 档距倍数，0.5–1；默认 0.55；偏离当前中心严格超过此倍数时换挡，并在同一周期按新中心计算弹力 |
 | min_position / max_position | 有序整数，±10000 |
-| mode | 0=自由，1=档位，2=有限行程，3=弹簧 |
+| mode | 0=自由，1=档位，2=有限行程，3=弹簧；4–16 为参考预设，16=无摩擦，映射见上方 v20 |
 
-运行期间允许修改手感参数；电气参数需要先停机。只调整强度、阻尼、切换点和电流限制时保留档位中心与电流环积分；模式、档距或行程边界改变时在当前机械位置重建中心，逻辑位置为 clamp(0, min_position, max_position)。被状态机拒绝的请求（例如运行中重复 enable）也不会续期通讯看门狗。显式修改配置母线/增益会清除电角度有效标志，要求重新校准；正常 ADC2 母线更新不修改配置，也不使校准失效。
+原 0–3 模式的手感参数允许在运行期间修改；参考模式 4–15 的独立参数按 v21 节要求先停机。电气参数也需要先停机。原模式只调整强度、阻尼、切换点和电流限制时保留档位中心与电流环积分；模式、档距或行程边界改变时在当前机械位置重建中心，逻辑位置为 clamp(0, min_position, max_position)。参考模式使用其独立配置的初始 position。被状态机拒绝的请求（例如运行中重复 enable）也不会续期通讯看门狗。显式修改配置母线/增益会清除电角度有效标志，要求重新校准；正常 ADC2 母线更新不修改配置，也不使校准失效。
 
 运行电流上限与异常停机阈值用途不同。目标始终限制在 `±current_limit`，并按实测相电流和 d/q 电流进一步收减。v6 沿用自 v4 起的分级瞬态保护：
 
@@ -310,7 +367,7 @@ v4 保留兼容字段 `detent_quiet_velocity:false`，实验性的两编码器�
 | `max_voltage_limit` | 当前配置母线下允许的配置电压上限；v5 不再固定限制为 5 V，实时能力另见 `available_voltage_limit`；不是实测电机端电压 |
 | `pwm_half_period_ticks` / `pwm_resolution_hz` | PWM 半周期计数和计数时钟；本实验分别为 4000 和 80000000，即每微秒 80 tick |
 
-这些诊断值与最新采样一起发布，不能仅凭一份低速 `status` 推断所有控制周期的行为。诊断读取仍每次最多返回 4 条记录，完整 JSON 回复须小于客户端 16384 字节行上限；追加字段会增加串口传输时间。
+这些诊断值与最新采样一起发布，不能仅凭一份低速 `status` 推断所有控制周期的行为。诊断读取仍每次最多返回 4 条记录，完整 JSON 回复须小于当前客户端 32768 字节行上限（该历史实验最初为 16384 字节）；追加字段会增加串口传输时间。
 
 `reset_reason` 是 ESP-IDF 复位原因枚举，`uptime_ms` 是本次启动时间，`minimum_free_heap` 是启动后最小剩余堆内存字节数；这些字段用于区分端口异常、设备复位和资源问题。
 
@@ -343,7 +400,11 @@ v4 保留兼容字段 `detent_quiet_velocity:false`，实验性的两编码器�
 - `calibration`：valid、direction（±1）、pole_pairs（固定 7）、electrical_zero（rad）。NVS 同时保存编码器身份；读取旧版本时将其视为 AS5600 校准。与当前源码所选类型不匹配时仍恢复 `config`，但 `calibration.valid` 为 false，`enable` 返回 `calibrate_first`。重新校准并在停机后 `save`，才保存新编码器的校准。更换同型号传感器或调整机械安装也应重新校准，类型身份不能自动识别这类机械变化。
 - `calibration_quality` / `calibration_report`：分别为已接受结果的质量证据和最近一次尝试，详见“校准请求与质量结果”。取消或失败只更新后者，不能据后者覆盖仍被保留的已接受结果。
 
-设备不自动重连、不自动清除或恢复锁存故障。正常 active 会话中的高速触觉衰减会按上述阈值自动恢复；这不解除任何锁存故障。上位机在每次回复后等待约 40 ms 再轮询；完整 JSON 在 115200 baud 下的传输耗时也计入实际刷新周期。退出/切换产品/关闭窗口会停机并释放串口。默认 `KNOB_HOST_LEASE_MS=0`，USB 丢失或停止查询不会单独触发停机；设备保持已明确启用的手感。退出软件时应显式发送 disable。需要通讯租约的产品可在构建时设置正数毫秒值，此时仅成功接受的命令续期，超时锁存 `host_timeout`。
+设备不自动重连、不自动清除或恢复锁存故障。正常 active 会话中的高速触觉衰减会按上述阈值自动恢复；这不解除任何锁存故障。上位机串行查询快照，收到完整回复后再等待下一次查询；轮询频率只影响显示刷新，不是触觉控制周期。
+
+默认 `KNOB_HOST_LEASE_MS=0`，USB 丢失、停止查询、上位机切换页面或关闭窗口都不会单独触发停机；设备保持已明确启用的手感。cf-gui 的智能旋钮工作台将“断开连接”与“停止电机”分开：断开只释放串口，只有显式停止操作发送 `disable`。重新连接只读取设备当前状态，不回放本地配置、不自动使能、清故障或保存。固件的上电状态仍为 idle；独立运行不等于上电自动驱动。
+
+触觉状态机、无摩擦保持、限流和故障保护均由 ESP32 电机任务执行，USB 控制台通过队列提交离散命令。定时测试脚本可在其明确的测试生命周期结束时主动 `disable`，这不是固件对普通上位机的存活要求。需要通讯租约的产品可在构建时设置正数毫秒值，此时仅成功接受的命令续期，超时锁存 `host_timeout`；主机应按实际 `host_lease_ms` 显示该设备的行为，不能假定任何构建均可离线持续运行。
 
 ## 可选板上诊断构建
 
@@ -356,7 +417,7 @@ v4 保留兼容字段 `detent_quiet_velocity:false`，实验性的两编码器�
 {"id":13,"op":"diagnose","axis":"d","mode":0,"velocity":0,"current":0.3,"drive_ms":500,"observe_ms":500}
 ```
 
-`diagnose` 仅在 idle 且已校准时启动独立 FreeRTOS 任务。省略 `axis` 或指定 `"q"` 时保持原加速/释放行为：mode=0–3，velocity 的绝对值 10–60 rad/s，current=0.02–0.25 A，drive_ms=50–500，observe_ms=500–3000。`current` 只限制驱动阶段的测试目标；释放阶段恢复当前配置的手感及运行电流上限。任务按当前电气参数和指定模式加速、释放，正常电流调节和所有硬件保护保留；速度超过 75 rad/s 中止。测试时间由电机控制任务限定，测试任务在该固定计划内续期租约，所以无需 USB 持续轮询；结束停机并恢复原 RAM 配置，不保存 NVS。上电不自动测试。
+`diagnose` 仅在 idle 且已校准时启动独立 FreeRTOS 任务。省略 `axis` 或指定 `"q"` 时执行加速/释放：mode=0–16，velocity 的绝对值 1–60 rad/s，current=0.02–0.25 A，drive_ms=50–3000，observe_ms=500–10000。驱动采用独立速度 PI（Kp=0.015、Ki=0.04），前 50 ms 爬升目标；无摩擦保持控制器在这段时间只观察，释放时获取实测速度。`current` 只限制驱动阶段的测试目标；释放阶段恢复当前配置的手感及运行电流上限。正常电流调节和所有硬件保护保留；速度超过 75 rad/s 中止。总期限由电机控制任务在 ADC 有效性判断前检查，采样失败不会延长驱动；测试任务在固定计划内续期租约，无需 USB 持续轮询。结束停机并恢复原 RAM 配置，不保存 NVS。上电不自动测试。
 
 `axis:"d"` 选择 v10 固定参考系注流。`mode` 和 `velocity` 可以省略，默认 0；显式给出 velocity 时必须为 0。`current` 范围为 **0.05–3 A**，且不得超过当前 `config.current_limit`；`drive_ms=50–30000`，`observe_ms=100–1000`。请求电流先经过约 200 ms 的平滑爬升，再由正常限流器和 PI 调节；drive_ms 小于 200 时会在爬升完成前结束。`target_d` 报告限流后的实际请求，配置或请求为 3 A 不表示绕组已达到 3 A。
 
@@ -368,11 +429,11 @@ d 轴驱动期满后立即请求零电压，观察阶段继续保持零输出；
 
 可选 `diagnostic` 对象含 busy、cancelled、axis、reference、stage、count、peak_speed、peak_current、muted_samples、recovered。stage：0=空闲，1=准备，2=测试驱动，3=释放，4=完成，5=中止，6=普通手拨记录中，7=手拨记录已冻结。recovered 表示 q 轴释放阶段经历完整静音后力度恢复到 1；不等同于机械已完全静止，也不是 d 轴诊断的电流跟踪验收值。q 轴驱动阶段的测试电流用于模拟外部甩转，因此不受触觉静音系数影响，仍受电流限制约束。
 
-样本为数组：`[elapsed_us, angle, velocity, target, iq, id_current, haptic_scale, voltage_q, phase_peak, flags, velocity_fast, voltage_d, adc_raw_a, adc_raw_b, sample_start_tick, sample_end_tick]`，加速/释放测试间隔约 2 ms，容量 2048。v2 在旧版 12 项数组末尾追加两相原始 ADC 码及采样窗口时刻，便于排查孤立电流尖峰；读取旧固件时应接受缺少末尾四项。flags 的低 8 位为 stage，bit 8 为 haptic_paused，bit 9 为 speed_limited，bits 16–17 / 18–19 为两次实际采样的相号 0/1/2。电流方向与普通遥测相同。取回样本使用原协议身份、请求 ID 和 16384 字节主机回复缓冲上限（请求正文最大 2047 字节）。
+样本的前 16 列保持：`[elapsed_us, angle, velocity, target, iq, id_current, haptic_scale, voltage_q, phase_peak, flags, velocity_fast, voltage_d, adc_raw_a, adc_raw_b, sample_start_tick, sample_end_tick]`，容量 2048。v2 在旧版 12 项数组末尾追加两相原始 ADC 码及采样窗口时刻；读取旧固件时应接受缺少末尾四项。flags 的低 8 位为 stage，bit 8 为 haptic_paused，bit 9 为 speed_limited，bits 16–17 / 18–19 为两次实际采样的相号 0/1/2。电流方向与普通遥测相同。取回样本使用原协议身份、请求 ID 和当前 32768 字节主机回复缓冲上限（请求正文最大 2047 字节）。
 
-v10 d 轴诊断在该数组末尾追加第 17 项 `target_d`，q 轴诊断仍为 16 项。d 轴采集间隔为 `max(200, ceil((drive_us + observe_us) / 2047))` µs，以便 2048 点缓冲覆盖较长测试；有效采样不足时实际记录可能更稀疏。USB 快照均值和这类抽取记录不是完整 5 kHz 电流纹波。
+v10 d 轴诊断在该数组末尾追加第 17 项 `target_d`，v20 保留该布局。v20 q 轴诊断追加四项 `hold_phase, hold_reference, hold_correction, hold_feedforward`，共 20 列。两种轴的采集间隔均为 `max(200, ceil((drive_us + observe_us) / 2047))` µs，实际按有效控制 tick 向上取整，保证缓冲覆盖长释放尾段；有效采样不足时记录更稀疏。USB 快照均值和抽取记录不是完整 5 kHz 电流纹波。
 
-`drive_ms=50` 的短驱动阶段按完整控制频率记录（目标 5 kHz），便于观察固定电流目标下的采样纹波；释放阶段仍约 2 ms。最长释放 3000 ms 时，约 250 个驱动样本加 1500 个释放样本不会占满缓冲。
+历史短驱动的全频率记录已改用上述统一周期；普通 enable 的环形记录仍按完整控制频率采集。
 
 `diagnostic_hold` 是有载斜坡排查用的短时目标保持，仅在 active、有有效电流、未运行其他诊断且速度低于 2 rad/s 时接受。`current` 使用机械方向，幅值 0.04–0.25 A，不得超过运行电流上限，符号须与当时目标一致。它保持请求目标最多 750 ms，仍经过正常速度包络、限流、PI 和故障保护。超过起点四分之一挡宽（上限 0.05 rad）或速度达到 5 rad/s 会提前停止。期间只接受 status/disable，不能续期；结束自动失能并冻结普通环形记录，flags bit 11 标识保持样本。该命令不保存配置，不在上电时启动；主机应使用保持前稳定目标的均值，避免负载变化混淆比较。750 ms 保持后的 5 kHz 环形记录只覆盖保持稳态，不包含切换起点。
 
