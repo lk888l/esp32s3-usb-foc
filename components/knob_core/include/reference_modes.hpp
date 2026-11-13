@@ -51,8 +51,9 @@ bool same_reference_config(const ReferenceModeConfig& left, const ReferenceModeC
 class ReferenceHaptics {
 public:
     // Configuration is validated on reset, outside the repeated control step.
-    // Call reset after applying changed parameters, including for the same mode.
     void reset(float angle, int preset, const ReferenceModeConfig& config);
+    void reconfigure(float angle, int preset, const ReferenceModeConfig& previous,
+                     const ReferenceModeConfig& next);
     KNOB_IRAM float step(int preset, const ReferenceModeConfig& config,
                          float angle, float velocity, float dt, float current_limit);
     // Default wrappers retain source compatibility for old tests and callers.
@@ -73,5 +74,6 @@ private:
     bool click_active_ = false;
     bool high_speed_ = false;
     bool config_valid_ = false;
+    bool suppress_click_ = false;
 };
 } // namespace knob

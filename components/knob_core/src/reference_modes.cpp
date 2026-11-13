@@ -174,6 +174,23 @@ void ReferenceHaptics::reset(float angle, int preset, const ReferenceModeConfig&
     config_valid_ = !validate_reference_config(config, preset);
     position_ = config_valid_ ? config.position : 0;
 }
+void ReferenceHaptics::reconfigure(float angle, int preset, const ReferenceModeConfig& previous,
+                                  const ReferenceModeConfig& next) {
+    if (preset != preset_) { reset(angle, preset, next); return; }
+    config_valid_ = !validate_reference_config(next, preset);
+    if (previous.width != next.width || previous.bounded != next.bounded ||
+        ((previous.bounded || next.bounded) &&
+         (previous.min_position != next.min_position || previous.max_position != next.max_position))) {
+        if (next.bounded) position_ = std::clamp(position_, next.min_position, next.max_position);
+        center_ = angle;
+        sub_position_ = 0;
+        idle_elapsed_ = 0;
+    }
+    // A new threshold/list is not a physical detent crossing. Stored initial
+    // position only takes effect on explicit reset or on entering this mode.
+    click_active_ = false;
+    suppress_click_ = true;
+}
 
 float ReferenceHaptics::step(int preset, float angle, float velocity,
                               float dt, float current_limit) {
@@ -232,12 +249,13 @@ float ReferenceHaptics::step(int preset, const ReferenceModeConfig& p, float ang
     if (!click_allowed || click_elapsed_ >= .004f) click_active_ = false;
     // Complete both lobes before accepting another crossing. Retriggering
     // the first lobe at high detent rates would create sustained braking.
-    if (position_ != previous_position && click_allowed && p.click > 0 && !click_active_) {
+    if (position_ != previous_position && click_allowed && p.click > 0 && !click_active_ && !suppress_click_) {
         // Oppose the crossing first, then release; deterministic in both directions.
         click_direction_ = position_ > previous_position ? 1.0f : -1.0f;
         click_elapsed_ = 0;
         click_active_ = true;
     }
+    suppress_click_ = false;
     const float click = click_active_
         ? (click_elapsed_ < .002f ? click_direction_ : -click_direction_) * p.click : 0;
     requested += click;

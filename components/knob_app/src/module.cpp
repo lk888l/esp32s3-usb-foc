@@ -6,6 +6,7 @@
 #include "encoder_mailbox.hpp"
 #include "encoder_config.hpp"
 #include "reference_modes.hpp"
+#include "live_config.hpp"
 #include "sampling_recovery.hpp"
 #include "control_timing.hpp"
 #include "current_offsets.hpp"
@@ -149,6 +150,7 @@ private:
     ReferenceHaptics reference_haptic_;
     Frictionless frictionless_;
     HapticSpeedLimiter haptic_speed_;
+    HapticTransition haptic_transition_;
     CurrentLoop current_loop_;
     QuietOutput quiet_output_;
     CurrentLimiter current_limiter_;
@@ -245,6 +247,7 @@ private:
         quiet_output_.reset(); state.quiet_output = false;
         state.current_limited = false; state.current_target_limit = 0;
         haptic_speed_.reset(); state.haptic_scale = 0;
+        haptic_transition_.reset();
         reset_frictionless();
         state.speed_limited = false; state.haptic_paused = false;
         current_limiter_.reset(state.config.current_limit); trip_update_at_ = 0;
@@ -455,38 +458,32 @@ private:
             halt(); update_bus_voltage(now); return nullptr;
         case Op::configure: {
             const auto& c = r.config;
-            if (const char* e = validate(c)) return e;
-            if (r.frictionless_update)
-                if (const char* e = validate_frictionless(r.frictionless_config)) return e;
-            bool reference_changed = false;
-            for (int i = 0; i < reference_config_count; ++i) {
-                if (!(r.reference_update_mask & (1u << i))) continue;
-                if (const char* e = validate_reference_config(r.reference_modes[i], i)) return e;
-                reference_changed |= !same_reference_config(state.reference_modes[i], r.reference_modes[i]);
-            }
-            // Geometry, stored position and force changes are committed only
-            // while idle. A rejected patch cannot partially update any mode.
-            if (reference_changed && state.state != State::idle) return "disable_before_reference_config";
-            const bool electrical = c.bus_voltage != state.config.bus_voltage || c.sense_gain != state.config.sense_gain ||
-                c.current_kp != state.config.current_kp || c.current_ki != state.config.current_ki;
-            if (energized() && (electrical || state.state != State::active)) return "disable_before_electrical_config";
-            const bool current_changed = c.current_limit != state.config.current_limit;
+            LiveConfigChange change;
+            const auto config_state = state.state == State::idle ? ConfigState::idle :
+                state.state == State::active ? ConfigState::active : ConfigState::unavailable;
+            if (const char* e = plan_live_config(config_state, state.config, c,
+                    state.reference_modes, r.reference_modes, r.reference_update_mask,
+                    state.frictionless_config, r.frictionless_update ? &r.frictionless_config : nullptr,
+                    change)) return e;
             // Retain overload/peak exposure across live tuning. Configuration
             // changes cannot stand in for valid below-threshold recovery.
             if (c.sense_gain != state.config.sense_gain || c.bus_voltage != state.config.bus_voltage) {
                 state.calibration.valid = false; state.calibration_quality = {};
             }
             haptic_.reconfigure(state.config, c, angle_.angle());
+            const auto previous_reference = reference_config(c.mode);
             for (int i = 0; i < reference_config_count; ++i)
                 if (r.reference_update_mask & (1u << i)) state.reference_modes[i] = r.reference_modes[i];
-            if (c.mode != state.config.mode || reference_changed) {
+            if (change.mode) {
                 reference_haptic_.reset(angle_.angle(), static_cast<int>(c.mode) - 4, reference_config(c.mode));
-                reset_frictionless(); quiet_output_.reset(); current_loop_.reset();
-            }
-            if (r.frictionless_update) {
-                state.frictionless_config = r.frictionless_config;
                 reset_frictionless();
+            } else if (change.reference_feel) {
+                reference_haptic_.reconfigure(angle_.angle(), static_cast<int>(c.mode) - 4,
+                                              previous_reference, reference_config(c.mode));
             }
+            if (change.frictionless) state.frictionless_config = r.frictionless_config;
+            if (state.state == State::active && change.output) haptic_transition_.begin();
+            if (change.output) { quiet_output_.reset(); pulse_start_ = 0; }
             state.config = c;
             update_bus_voltage(now);
             current_limiter_.configure(c.current_limit);
@@ -497,17 +494,18 @@ private:
                 // The new torque limit is immediate. Allow winding current to
                 // decay before tightening the ordinary overload band. Repeated
                 // edits must not postpone an already pending threshold update.
-                if (current_changed && !trip_update_at_) trip_update_at_ = now + 20000;
+                if (change.current && !trip_update_at_) trip_update_at_ = now + 20000;
             } else {
                 state.current_trip_limit = trip; trip_update_at_ = 0;
                 if (state.state == State::active) board_.set_trip(state.offsets, c.sense_gain, trip);
             }
             update_haptic_position();
-            if (electrical) { current_loop_.reset(); control_clock_.reset(); }
-            pulse_start_ = 0; return nullptr;
+            if (change.electrical) { current_loop_.reset(); control_clock_.reset(); }
+            return nullptr;
         }
         case Op::zero:
             if (state.state != State::idle && state.state != State::active) return "busy";
+            haptic_transition_.reset(); pulse_start_ = 0;
             haptic_.reset(angle_.angle(), std::clamp(0, state.config.min_position, state.config.max_position));
             reference_haptic_.reset(angle_.angle(), static_cast<int>(state.config.mode) - 4, reference_config(state.config.mode));
             reset_frictionless(); update_haptic_position(); state.sub_position = 0; return nullptr;
@@ -589,7 +587,7 @@ private:
                 state.state = State::active;
                 haptic_.reset(angle_.angle(), std::clamp(0,c.min_position,c.max_position));
                 reference_haptic_.reset(angle_.angle(), static_cast<int>(c.mode) - 4, reference_config(c.mode));
-                reset_frictionless(); haptic_speed_.reset();
+                reset_frictionless(); haptic_speed_.reset(); haptic_transition_.reset();
             }
             return;
         }
@@ -691,9 +689,10 @@ private:
                     if (elapsed < 6000) state.target += elapsed < 3000 ? 0.08f : -0.08f;
                     else pulse_start_ = 0;
                 }
-                zero_torque_intent = state.target == 0;
                 const float mode_limit = reference_mode(c.mode) && c.mode != Mode::frictionless ?
                     std::min(c.current_limit, reference_current_limit) : c.current_limit;
+                state.target = haptic_transition_.step(state.target, mode_limit, dt);
+                zero_torque_intent = state.target == 0;
                 state.target = haptic_speed_.step(state.target, angle_.velocity(), mode_limit, dt);
                 state.haptic_scale = haptic_speed_.scale();
                 state.speed_limited = haptic_speed_.limited(); state.haptic_paused = haptic_speed_.paused();

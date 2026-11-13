@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.20)
 project(knob_host_tests LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 enable_testing()
+add_executable(live_config_tests live_config_tests.cpp
+    ../components/knob_core/src/control.cpp ../components/knob_core/src/reference_modes.cpp
+    ../components/knob_core/src/frictionless.cpp)
+target_include_directories(live_config_tests PRIVATE ../components/knob_core/include)
+target_compile_options(live_config_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME live_configuration COMMAND live_config_tests)
 set(KNOB_CJSON_DIR "$ENV{IDF_PATH}/components/json/cJSON" CACHE PATH "Directory containing ESP-IDF's cJSON.c and cJSON.h for protocol host tests")
 if(EXISTS "${KNOB_CJSON_DIR}/cJSON.c" AND EXISTS "${KNOB_CJSON_DIR}/cJSON.h")
     enable_language(C)

@@ -213,7 +213,9 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "protocol", 1);
     cJSON_AddNumberToObject(root, "control_stack_free", s.control_stack_free);
     cJSON_AddNumberToObject(root, "console_stack_free", uxTaskGetStackHighWaterMark(nullptr));
-    cJSON_AddStringToObject(root, "firmware", "dma-v22-independent-detents");
+    cJSON_AddStringToObject(root, "firmware", "dma-v23-live-tuning");
+    cJSON_AddBoolToObject(root, "live_haptics_config", true);
+    cJSON_AddNumberToObject(root, "config_transition_ms", 20);
     cJSON_AddNumberToObject(root, "reference_config_version", reference_config_version);
     cJSON_AddNumberToObject(root, "reference_current_limit", reference_current_limit);
     cJSON_AddStringToObject(root, "reference_haptic_model", "esp32_detent_v2");

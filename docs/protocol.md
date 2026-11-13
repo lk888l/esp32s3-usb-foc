@@ -1,10 +1,22 @@
 # SmartKnob USB 协议 v1
 
-当前固件为 **`dma-v22-independent-detents`**，协议仍为 v1，沿用 `20k65_sampling`、20 kHz PWM 和 5 kHz 控制。2026-11-05 的 5 kHz / 90% 与 10 kHz / 85% 占空比实验已按用户要求回滚，详见[实验与最终恢复记录](duty90-20261105.md)。采样检查工具按设备 `control_nominal_hz` 的 98% 设置默认有效频率门槛，并验证实际锁存 duty；失败后停止后续电流阶梯。
+当前固件为 **`dma-v23-live-tuning`**，协议仍为 v1，沿用 `20k65_sampling`、20 kHz PWM 和 5 kHz 控制。2026-11-05 的 5 kHz / 90% 与 10 kHz / 85% 占空比实验已按用户要求回滚，详见[实验与最终恢复记录](duty90-20261105.md)。采样检查工具按设备 `control_nominal_hz` 的 98% 设置默认有效频率门槛，并验证实际锁存 duty；失败后停止后续电流阶梯。
+
+## v23：运行中更新手感
+
+`live_haptics_config:true` 表示 `configure` 可在 `idle` 或 `active` 更新参考参数，`config_transition_ms:20` 报告配置过渡时间。协议保持 v1，参考参数保持版本 2，NVS 布局不变；旧客户端仍可使用现有命令。主机应按能力字段判断，不用固件名称推测。
+
+整个请求先验证再提交。校准、诊断和故障状态不能配置；忙碌/故障返回 `idle_or_active_required`，诊断沿用 `diagnostic_busy`。母线配置、感测增益、电流环 Kp/Ki 在线修改仍返回 `disable_before_electrical_config`。拒绝不部分更新参数，也不重置保护状态。
+
+切换模式以当前物理角度建立中心，使用目标模式的既有参数和初始逻辑档位。同模式调力度/阻尼等保留中心和逻辑位置；改变档距或行程保留逻辑档位、限制到新范围，并以当前角度重建中心。只改变初始逻辑档位不会移动当前位置，它在切换模式或 `zero` 时使用。改变非当前模式不重置当前控制状态。参数更新不会产生合成切档点击，旧点击脉冲在当前手感改变时清除。
+
+`frictionless` 省略或同值重发不重置保持状态；实际修改继续使用已获取的速度目标和积分，并由新电流预算约束。普通调参不清空电流 PI、过流暴露累计或高速保护。改变当前手感时目标电流在 20 ms 内过渡，重复配置从当前过渡输出继续，电流限值立即生效；正常档位/点击没有额外持续滤波，因此 `current_target_slew:false` 仍指正常控制路径。`zero`、停止和重新使能清除配置过渡状态。
+
+`save` 仍要求关闭输出。配套 GUI 的一键启动使用既有 `status/configure/calibrate/save/enable` 组合：有有效校准则跳过校准和保存；缺少校准则在成功回到 idle 后保存一次，确认采样就绪再 enable。固件不会在上电时自行启用，也不会在 configure 时写 NVS。运行中修改只作用于 RAM。
 
 ## 2026-11-11 v22：物理单位与独立点击开关
 
-`reference_config_version:2`、`reference_haptic_model:"esp32_detent_v2"` 标识新版参数语义。沿用模式 4–15 的独立完整条目补丁、停机应用、只读默认值查询和显式 save。省略整个参数库或某个模式时仍保留设备现有值。相同参数重发不重置正在运行的模式。
+`reference_config_version:2`、`reference_haptic_model:"esp32_detent_v2"` 标识新版参数语义。沿用模式 4–15 的独立完整条目补丁、只读默认值查询和显式 save；v23 新增在线应用能力，见上节。省略整个参数库或某个模式时仍保留设备现有值。相同参数重发不重置正在运行的模式。
 
 相对下方 v21 表格，改变如下；其余几何字段和范围保持：
 
@@ -28,7 +40,7 @@
 
 `reference_config_version:1` 表示模式 4–15 支持独立参数。正常状态在 `config.reference_modes` 返回全部 12 项，以模式编号字符串为键。`reference_current_limit` 报告保留的普通参考模式电流限制 0.45 A；公共 `config.current_limit` 仍可进一步限制输出。
 
-`configure.config` 仍携带完整公共配置；可选的 `reference_modes` **只包含需要修改的模式**，每个列出的模式必须带齐下面所有字段。省略的模式保持原值；空对象无变化。任何字段或模式非法都拒绝整个请求，不部分应用。仅实际发生变化的参考参数要求 `state=idle`，否则返回 `disable_before_reference_config`；同值重发不重置运行状态。仅切换 `config.mode` 沿用现有行为。
+`configure.config` 仍携带完整公共配置；可选的 `reference_modes` **只包含需要修改的模式**，每个列出的模式必须带齐下面所有字段。省略的模式保持原值；空对象无变化。任何字段或模式非法都拒绝整个请求，不部分应用。v21/v22 仅实际发生变化的参考参数要求 `state=idle`，否则返回 `disable_before_reference_config`；v23 的在线行为按上节能力字段判断。同值重发不重置运行状态。仅切换 `config.mode` 沿用现有行为。
 
 | 字段 | 含义与范围 |
 | --- | --- |

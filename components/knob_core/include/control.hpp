@@ -191,7 +191,7 @@ KNOB_IRAM float limit_haptic_current(float requested, float velocity, float limi
 class Haptics {
 public:
     void reset(float angle, int position = 0) { center_ = angle; origin_ = angle; position_ = position; }
-    // Preserve the center while tuning strength; geometry changes start here.
+    // Tuning retains the center; same-mode geometry retains the logical count.
     void reconfigure(const Config& previous, const Config& next, float angle);
     KNOB_IRAM float step(const Config& config, float angle, float velocity);
     int position() const { return position_; }
@@ -199,5 +199,16 @@ public:
 private:
     float center_ = 0, origin_ = 0;
     int position_ = 0;
+};
+// A bounded handover only after a configuration change. Ordinary detents and
+// clicks bypass interpolation once it completes. Call before speed/foldback.
+class HapticTransition {
+public:
+    void reset() { *this = {}; }
+    void begin() { start_ = output_; remaining_ = .020f; }
+    KNOB_IRAM float step(float requested, float limit, float dt);
+    bool active() const { return remaining_ > 0; }
+private:
+    float output_ = 0, start_ = 0, remaining_ = 0;
 };
 } // namespace knob

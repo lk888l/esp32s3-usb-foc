@@ -197,10 +197,24 @@ void SettlingMonitor::update(float angle, float dt) {
     }
 }
 void Haptics::reconfigure(const Config& previous, const Config& next, float angle) {
-    if (previous.mode != next.mode || previous.width != next.width ||
-        previous.min_position != next.min_position || previous.max_position != next.max_position) {
+    if (previous.mode != next.mode) {
         reset(angle, std::clamp(0, next.min_position, next.max_position));
+    } else if (previous.width != next.width || previous.min_position != next.min_position ||
+               previous.max_position != next.max_position) {
+        reset(angle, next.mode == Mode::bounded ?
+              std::clamp(position_, next.min_position, next.max_position) : position_);
     }
+}
+float HapticTransition::step(float requested, float limit, float dt) {
+    if (!std::isfinite(requested) || !std::isfinite(limit) || limit <= 0 ||
+        !std::isfinite(dt) || dt <= 0 || dt > .002f) { reset(); return 0; }
+    requested = std::clamp(requested, -limit, limit);
+    if (remaining_ > 0) {
+        remaining_ = std::max(0.0f, remaining_ - dt);
+        const float mix = 1.0f - remaining_ / .020f;
+        output_ = std::clamp(start_ + mix * (requested - start_), -limit, limit);
+    } else output_ = requested;
+    return output_;
 }
 float HapticSpeedLimiter::step(float requested, float velocity, float limit, float dt) {
     if (!std::isfinite(requested) || !std::isfinite(velocity) ||
