@@ -4,6 +4,8 @@
 #include "settings_identity.hpp"
 #include "reference_modes.hpp"
 #include "reference_json.hpp"
+#include "usb_device.hpp"
+#include "wheel_tracker.hpp"
 #include "nvs.h"
 #include "esp_crc.h"
 #include "esp_system.h"
@@ -84,7 +86,8 @@ const char* decode_request(const char* line, Request& r) {
     if (!cJSON_IsString(op)) return fail("invalid_op");
     struct NamedOp { const char* name; Op op; };
     constexpr NamedOp names[] = {{"status", Op::status}, {"configure", Op::configure}, {"calibrate", Op::calibrate},
-        {"enable", Op::enable}, {"disable", Op::disable}, {"clear", Op::clear}, {"zero", Op::zero}, {"pulse", Op::pulse}, {"save", Op::save}
+        {"enable", Op::enable}, {"disable", Op::disable}, {"clear", Op::clear}, {"zero", Op::zero}, {"pulse", Op::pulse}, {"save", Op::save},
+        {"wheel_enable", Op::wheel_enable}, {"wheel_disable", Op::wheel_disable}
 #if CONFIG_KNOB_DIAGNOSTICS
         , {"diagnose", Op::diagnose}, {"diagnostic_read", Op::diagnostic_read}, {"diagnostic_hold", Op::diagnostic_hold},
         {"diagnostic_restore_calibration", Op::diagnostic_restore_calibration}
@@ -213,7 +216,17 @@ cJSON* encode_reply(int id, const Reply& r) {
     cJSON_AddNumberToObject(root, "protocol", 1);
     cJSON_AddNumberToObject(root, "control_stack_free", s.control_stack_free);
     cJSON_AddNumberToObject(root, "console_stack_free", uxTaskGetStackHighWaterMark(nullptr));
-    cJSON_AddStringToObject(root, "firmware", "dma-v23-live-tuning");
+    cJSON_AddStringToObject(root, "firmware", "dma-v24-usb-wheel");
+    cJSON* wheel = cJSON_AddObjectToObject(root, "usb_wheel");
+    const auto wheel_state = usb::wheel_status();
+    cJSON_AddBoolToObject(wheel, "supported", true);
+    cJSON_AddBoolToObject(wheel, "enabled", wheel_state.enabled);
+    cJSON_AddBoolToObject(wheel, "mounted", wheel_state.mounted);
+    cJSON_AddBoolToObject(wheel, "suspended", wheel_state.suspended);
+    cJSON_AddBoolToObject(wheel, "ready", wheel_state.ready);
+    cJSON_AddNumberToObject(wheel, "steps_per_turn", usb::WheelTracker::steps_per_turn);
+    cJSON_AddNumberToObject(wheel, "reports", wheel_state.reports);
+    cJSON_AddNumberToObject(wheel, "steps", wheel_state.steps);
     cJSON_AddBoolToObject(root, "live_haptics_config", true);
     cJSON_AddNumberToObject(root, "config_transition_ms", 20);
     cJSON_AddNumberToObject(root, "reference_config_version", reference_config_version);
@@ -346,7 +359,7 @@ cJSON* encode_reply(int id, const Reply& r) {
 #if CONFIG_KNOB_CONSOLE_UART
     cJSON_AddStringToObject(root, "transport", "uart0");
 #else
-    cJSON_AddStringToObject(root, "transport", "usb_serial_jtag");
+    cJSON_AddStringToObject(root, "transport", "usb_otg_cdc");
 #endif
     cJSON_AddStringToObject(root, "encoder", encoder_config::name);
     cJSON_AddStringToObject(root, "encoder_interface", encoder_config::transport);

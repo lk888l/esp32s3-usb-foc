@@ -46,7 +46,7 @@ def main():
         print("PASS:", name, flush=True)
     try:
         initial = device.request("status")
-        require(initial["state"] == "idle" and initial["transport"] == "usb_serial_jtag", "Expected idle native USB firmware")
+        require(initial["state"] == "idle" and initial["transport"] in ("usb_serial_jtag", "usb_otg_cdc"), "Expected idle native USB firmware")
         report["initial"] = initial
         require(initial.get("voltage_limit_automatic") is True and "voltage_limit" not in initial["config"],
                 "Voltage limit is still configurable")

@@ -2,6 +2,10 @@ cmake_minimum_required(VERSION 3.20)
 project(knob_host_tests LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 enable_testing()
+add_executable(wheel_tracker_tests wheel_tracker_tests.cpp)
+target_include_directories(wheel_tracker_tests PRIVATE ../components/knob_usb/include)
+target_compile_options(wheel_tracker_tests PRIVATE -Wall -Wextra -Werror -UNDEBUG)
+add_test(NAME usb_wheel_tracker COMMAND wheel_tracker_tests)
 add_executable(live_config_tests live_config_tests.cpp
     ../components/knob_core/src/control.cpp ../components/knob_core/src/reference_modes.cpp
     ../components/knob_core/src/frictionless.cpp)

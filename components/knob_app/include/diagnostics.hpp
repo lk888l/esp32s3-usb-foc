@@ -4,7 +4,11 @@
 #include <cmath>
 #include <cstdint>
 namespace knob {
+#ifdef CONFIG_KNOB_DIAGNOSTIC_CAPACITY
+constexpr int diagnostic_capacity = CONFIG_KNOB_DIAGNOSTIC_CAPACITY;
+#else
 constexpr int diagnostic_capacity = 2048;
+#endif
 // Explicit, diagnostics-only plateau. Never renew its deadline while active.
 // The caller retains the ordinary current/speed limits and fault handling.
 class DiagnosticHold {

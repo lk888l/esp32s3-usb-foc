@@ -5,7 +5,7 @@ choice KNOB_TRANSPORT
 config KNOB_CONSOLE_UART
     bool "DevKitC COM port (UART0 GPIO43/44, 115200)"
 config KNOB_CONSOLE_USB
-    bool "Native USB Serial/JTAG (GPIO19/20)"
+    bool "Native USB OTG CDC + HID mouse wheel (GPIO19/20)"
     help
         Connect to the board USB connector, not the COM/UART bridge.
         USB console logging alone does not receive SmartKnob commands.
@@ -121,4 +121,12 @@ config KNOB_DIAGNOSTICS
         Builds an idle test task and explicit diagnose/read commands. Each test
         uses the normal current regulator, records on-board samples, stops and
         restores the prior configuration. Never starts a test at boot.
+config KNOB_DIAGNOSTIC_CAPACITY
+    int "Diagnostic trace sample capacity"
+    depends on KNOB_DIAGNOSTICS
+    range 256 2048
+    default 1024
+    help
+        Reserves enough internal heap for TinyUSB and complete JSON replies.
+        This affects only diagnostic trace storage, never the control loop.
 endmenu

@@ -13,6 +13,7 @@
 #endif
 namespace knob {
 enum class Op { status, configure, calibrate, enable, disable, clear, zero, pulse, save,
+    wheel_enable, wheel_disable,
     restart_sampling // Internal console request after NVS writes; never decoded from JSON.
 #if CONFIG_KNOB_DIAGNOSTICS
     , diagnose, diagnostic_read, diagnostic_hold, diagnostic_restore_calibration, test_begin, test_end

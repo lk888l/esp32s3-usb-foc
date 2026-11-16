@@ -10,7 +10,7 @@
 #include "sampling_recovery.hpp"
 #include "control_timing.hpp"
 #include "current_offsets.hpp"
-#include "driver/usb_serial_jtag.h"
+#include "usb_device.hpp"
 #include "driver/uart.h"
 #include "freertos/queue.h"
 #include "nvs_flash.h"
@@ -25,25 +25,14 @@ int console_read(uint8_t* bytes, size_t capacity) {
 #if CONFIG_KNOB_CONSOLE_UART
     return uart_read_bytes(UART_NUM_0, bytes, capacity, pdMS_TO_TICKS(20));
 #else
-    return usb_serial_jtag_read_bytes(bytes, capacity, pdMS_TO_TICKS(20));
+    return usb::read(bytes, capacity);
 #endif
 }
 bool console_write(const char* bytes, size_t size) {
 #if CONFIG_KNOB_CONSOLE_UART
     return uart_write_bytes(UART_NUM_0, bytes, size) == static_cast<int>(size);
 #else
-    // The driver may enqueue only part of the frame before a timeout.
-    const int64_t deadline = Board::esp_time() + 100000;
-    size_t sent = 0;
-    while (sent < size && Board::esp_time() < deadline) {
-        // A ring-buffer item must fit in the driver's TX ring. Expanded
-        // telemetry can exceed its maximum item size even when the ring is
-        // empty; submit bounded chunks and keep the original frame deadline.
-        const int count = usb_serial_jtag_write_bytes(bytes + sent, std::min<size_t>(size - sent, 512), pdMS_TO_TICKS(10));
-        if (count < 0) return false;
-        sent += count;
-    }
-    return sent == size;
+    return usb::write(bytes, size);
 #endif
 }
 // Encoder transport waits on core 0; core 1 only copies a completed snapshot.
@@ -92,6 +81,7 @@ private:
             if (next.error) ++failures;
             next.failures = failures;
             portENTER_CRITICAL(&mux_); mailbox_.publish(next); portEXIT_CRITICAL(&mux_);
+            usb::publish_encoder(next.angle, next.timestamp_us, next.error == 0 && next.fault == EncoderFault::none);
         }
         board_.set_encoder_task(nullptr);
     }
@@ -393,6 +383,10 @@ private:
             return "diagnostic_cancelled";
 #endif
         switch (r.op) {
+        case Op::wheel_enable:
+        case Op::wheel_disable:
+            // USB-only operations are committed by Console after this reply.
+            return nullptr;
 #if CONFIG_KNOB_DIAGNOSTICS
         case Op::diagnostic_restore_calibration:
             // Restore an explicitly supplied pre-reflash RAM backup. Never
@@ -932,6 +926,7 @@ private:
                 // timestamp rather than compare new samples with pre-restart now.
                 if (request.op == Op::restart_sampling || request.op == Op::clear) continue;
             }
+            usb::input_allowed.store(ready_ && (state.state == State::idle || state.state == State::active), std::memory_order_relaxed);
             if (!ready_) continue;
             // The ISR watchdog measures task liveness, independently of current
             // window availability. Invalid ADC observations are handled below.
@@ -1154,6 +1149,8 @@ private:
             if (!matched) reply.error = "control_unavailable";
             else if (decode_error) reply.error = decode_error;
             else if (!reply.error && request.op == Op::save) save_and_restart(request, reply);
+            else if (!reply.error && (request.op == Op::wheel_enable || request.op == Op::wheel_disable))
+                usb::set_wheel_enabled(request.op == Op::wheel_enable);
         }
         cJSON* root = encode_reply(request.id, reply);
         if (!root) return;
@@ -1168,6 +1165,12 @@ private:
     void main() override {
         char line[2048]{}; size_t size = 0; bool discard = false;
         while (!should_exit()) {
+            if (usb::bootloader_requested()) {
+                Request stop{}; stop.op = Op::disable; stop.renew_lease = false;
+                Reply stopped{};
+                if (transact(stop, stopped, Board::esp_time() + 200000) && !stopped.error)
+                    usb::enter_bootloader();
+            }
             uint8_t bytes[128];
             const int count = console_read(bytes, sizeof(bytes));
             for (int i = 0; i < count; ++i) {
@@ -1280,10 +1283,8 @@ private:
         if (uart_param_config(UART_NUM_0, &config) != ESP_OK ||
             uart_set_pin(UART_NUM_0, 43, 44, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE) != ESP_OK ||
             uart_driver_install(UART_NUM_0, 2048, 4096, 0, nullptr, 0) != ESP_OK) return false;
-#else
-        usb_serial_jtag_driver_config_t config{.tx_buffer_size = 4096, .rx_buffer_size = 2048};
-        if (usb_serial_jtag_driver_install(&config) != ESP_OK) return false;
 #endif
+        if (!usb::initialize()) return false;
         console_installed_ = true;
         return motor_.start() && console_.start()
 #if CONFIG_KNOB_DIAGNOSTICS
@@ -1299,9 +1300,8 @@ private:
         if (console_installed_) {
 #if CONFIG_KNOB_CONSOLE_UART
             uart_driver_delete(UART_NUM_0);
-#else
-            usb_serial_jtag_driver_uninstall();
 #endif
+            if (!usb::shutdown()) return false;
             console_installed_ = false;
         }
 #if CONFIG_KNOB_DIAGNOSTICS

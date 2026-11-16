@@ -239,7 +239,7 @@ USB 发送改为每次最多 **512 字节**，修复扩展诊断回复超过 409
 
 每次回复包含 `device:"smartknob-s3"`、`protocol:1`、相同的 `id`、`ok`，以及当前状态/参数/校准/遥测。拒绝请求时额外含 `error`；解析或校验失败也查询真实快照，但不会续期心跳。控制任务不可用时会返回 `control_unavailable`，附带的默认快照不可作为真实测量。主机必须校验身份、协议和请求 ID，不能因为任意串口返回 JSON 就认作旋钮。
 
-可选字段 `transport` 为 `usb_serial_jtag` 或 `uart0`，用于显示设备实际使用的调参通道，不改变协议版本。编码器另由 `encoder`、`encoder_interface`、`encoder_resolution_bits`、`encoder_dma` 标识，默认值分别为 `MT6701`、`ssi_spi_dma`、14、true；切换源码中的 AS5600 后端时分别为 `AS5600`、`i2c`、12、false。旧上位机可以忽略新增字段，但不能继续把所有 `magnet` 数值当作 AS5600 STATUS。连接初期可在约 3 秒内重试只读 `status` 以等待固件启动；运行期请求维持短超时，不自动重发使能、校准等动作。`control_unavailable` 的默认快照必须作为通信失败处理，不得展示为真实 idle 状态。
+可选字段 `transport` 为 `usb_serial_jtag`、`usb_otg_cdc` 或 `uart0`，用于显示设备实际使用的调参通道，不改变协议版本。编码器另由 `encoder`、`encoder_interface`、`encoder_resolution_bits`、`encoder_dma` 标识，默认值分别为 `MT6701`、`ssi_spi_dma`、14、true；切换源码中的 AS5600 后端时分别为 `AS5600`、`i2c`、12、false。旧上位机可以忽略新增字段，但不能继续把所有 `magnet` 数值当作 AS5600 STATUS。连接初期可在约 3 秒内重试只读 `status` 以等待固件启动；运行期请求维持短超时，不自动重发使能、校准等动作。`control_unavailable` 的默认快照必须作为通信失败处理，不得展示为真实 idle 状态。
 
 | op | 语义 |
 |---|---|
@@ -461,3 +461,8 @@ device.request("diagnostic_restore_calibration",
 ```
 
 该接口不验证备份是否属于当前物理转子或磁铁安装位置；只有在安装与接线未变化时，原备份才仍有相同含义。普通运行配置仍通过停机后的完整 `configure` 恢复；`tools/stall_window_check.py` 本身不生成新校准，退出时核对配置和校准与进入时一致。
+
+
+## v24：USB 鼠标滚轮
+
+新增 `wheel_enable` / `wheel_disable`，只切换设备端 USB 滚轮，不修改 `config`、校准或 NVS。`status.usb_wheel` 返回能力、设备开关状态、枚举/暂停/可输出状态及累计输出计数。设备重启默认关闭，关闭调参端口不关闭已开启的 HID 滚轮。完整字段、标准鼠标报文与升级方法见 [USB 滚轮协议与使用说明](usb-wheel.md)。
